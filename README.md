@@ -92,7 +92,7 @@ For an in-depth architectural breakdown—including memory layout, asynchronous 
 ## Installation
 
 ### Linux & Windows
-Download pre-built `.deb`, `.AppImage`, or Windows installer binaries from [GitHub Releases](https://github.com/thekodeking/quarry/releases).
+Download a pre-built `.deb`, `.AppImage`, or `.rpm` for Linux (x86_64 or ARM64), or the Windows installer, from [GitHub Releases](https://github.com/thekodeking/quarry/releases). Fedora users can install the matching RPM with `sudo dnf install ./quarry-*.rpm`.
 
 ### macOS
 Download `Quarry-<version>.dmg` from [GitHub Releases](https://github.com/thekodeking/quarry/releases) and drag Quarry to Applications. The app is ad-hoc signed rather than notarized by Apple, so macOS blocks the first launch. Clear the quarantine flag once:
@@ -117,6 +117,42 @@ cp -R ../../dist/Quarry.app /Applications/
 
 ## Development
 
+Install the native prerequisites for your platform before compiling. Rust is also required; install it with [rustup](https://rustup.rs).
+
+### Debian / Ubuntu
+
+```sh
+sudo apt install build-essential pkg-config clang mold \
+  libasound2-dev libdbus-1-dev libfontconfig1-dev libfreetype6-dev \
+  libvulkan-dev libwayland-dev libx11-xcb-dev libxcb1-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libfuse2
+```
+
+### Arch Linux
+
+```sh
+sudo pacman -S --needed base-devel pkgconf clang mold \
+  alsa-lib dbus fontconfig freetype2 vulkan-headers vulkan-icd-loader \
+  wayland libx11 libxcb libxkbcommon libxkbcommon-x11 fuse2
+```
+
+### Fedora
+
+```sh
+sudo dnf install gcc-c++ pkgconf-pkg-config clang mold \
+  alsa-lib-devel dbus-devel fontconfig-devel freetype-devel \
+  vulkan-headers vulkan-loader-devel wayland-devel libX11-devel \
+  libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel fuse-libs
+```
+
+### macOS
+
+```sh
+xcode-select --install
+```
+
+The FUSE package is only needed for AppImage packaging; it is not required to compile Quarry.
+
 ```sh
 make            # List available commands
 make dev        # Run a debug build (fast compile)
@@ -133,11 +169,22 @@ Packages are generated using [cargo-packager](https://github.com/crabnebula-dev/
 
 ```sh
 cd crates/quarry-app
+cargo build --release -p quarry-app
 cargo packager --release -f app       # macOS .app
 # or: -f deb, -f appimage, -f nsis
 ```
 
-Or `make package`, which packages for the current OS (`OS=macos|linux|windows` to choose). On macOS that's the ad-hoc signed DMG from `scripts/package-macos.sh`.
+`cargo-packager` creates the DEB and AppImage packages; RPMs are assembled with [nfpm](https://github.com/goreleaser/nfpm) in the release workflow. Linux packages are built in parallel for x86_64 and ARM64 and published together. `make package` packages for the current OS (`OS=macos|linux|windows` to choose). On macOS that's the ad-hoc signed DMG from `scripts/package-macos.sh`.
+
+To build an RPM locally from the repository root after compiling, install nfpm with `go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest`, then run:
+
+```sh
+version=$(cargo pkgid -p quarry-app | sed 's/.*[#@]//')
+mkdir -p dist
+VERSION="$version" GOARCH="$(go env GOARCH)" nfpm package \
+  --packager rpm --config nfpm.yaml \
+  --target "dist/quarry-${version}-$(uname -m).rpm"
+```
 
 To create a new release, push a git tag matching the workspace version (e.g. `v0.1.0`).
 

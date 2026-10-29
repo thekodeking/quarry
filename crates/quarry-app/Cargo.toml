@@ -14,7 +14,6 @@ path = "src/main.rs"
 product-name = "Quarry"
 identifier = "dev.thekodeking.quarry"
 category = "DeveloperTool"
-before-packaging-command = "cargo build --release -p quarry-app"
 out-dir = "../../dist"
 binaries = [{ path = "quarry", main = true }]
 # Each format picks the file it needs

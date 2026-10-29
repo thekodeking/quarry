@@ -3,6 +3,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+if [ "${QUARRY_PREBUILT_BINARY:-0}" != 1 ]; then
+  cargo build --release -p quarry-app
+fi
+
 version=$(cargo pkgid -p quarry-app | sed 's/.*[#@]//')
 dmg="dist/Quarry-$version.dmg"
 

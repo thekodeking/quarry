@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.1.0 to build Linux, Windows and macOS packages and publish them as a GitHub release.
+# Compile once per platform/architecture, then package each format in parallel.
 # macOS ships an ad-hoc signed DMG (not notarized), so users clear quarantine once (see README).
 on:
   push:
@@ -15,89 +15,292 @@ env:
   RUST_MIN_STACK: "67108864"
 
 jobs:
-  package:
-    name: Package (${{ matrix.os }})
-    # Waits for a required reviewer on the "release" environment (repo Settings → Environments)
-    environment: release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            formats: deb,appimage
-          - os: windows-latest
-            formats: nsis
-    runs-on: ${{ matrix.os }}
+  build-linux-x86_64:
+    name: Build (Linux, x86_64)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Linux build dependencies & mold linker
-        if: runner.os == 'Linux'
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang mold libasound2-dev libdbus-1-dev libfontconfig1-dev \
             libfreetype6-dev libvulkan-dev libwayland-dev libx11-xcb-dev \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfuse2
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      # Restores the dependency cache warm-cache.yml saves on main (tag runs can't share caches with each other)
-      - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "quarry-release-${{ matrix.os }}"
+          shared-key: quarry-release-ubuntu-24.04
           save-if: false
-
-      # Install pre-compiled cargo-packager binary instead of compiling from source (saves 2-4 mins)
-      - name: Install cargo-packager
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-packager
-
-      # With the signing key set, cargo-packager also writes a .sig per bundle for the updater
-      - name: Build & package application
+      - name: Compile application
+        run: cargo build --release -p quarry-app
         env:
-          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
-          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
-          RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-fuse-ld=mold' || '' }}
-        run: cargo packager --release -f ${{ matrix.formats }}
-        working-directory: crates/quarry-app
-
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
       - uses: actions/upload-artifact@v4
         with:
-          name: quarry-${{ runner.os }}
-          path: |
-            dist/*.deb
-            dist/*.AppImage
-            dist/*.exe
-            dist/*.sig
+          name: quarry-build-linux-x86_64
+          path: target/release/quarry
           if-no-files-found: error
 
-  macos:
-    name: Package (macos-latest)
-    environment: release
+  build-linux-aarch64:
+    name: Build (Linux, ARM64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang mold libasound2-dev libdbus-1-dev libfontconfig1-dev \
+            libfreetype6-dev libvulkan-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfuse2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quarry-release-ubuntu-24.04-arm
+          save-if: false
+      - name: Compile application
+        run: cargo build --release -p quarry-app
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quarry-build-linux-aarch64
+          path: target/release/quarry
+          if-no-files-found: error
+
+  build-windows-x86_64:
+    name: Build (Windows, x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quarry-release-windows-latest
+          save-if: false
+      - run: cargo build --release -p quarry-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quarry-build-windows-x86_64
+          path: target/release/quarry.exe
+          if-no-files-found: error
+
+  build-macos-aarch64:
+    name: Build (macOS, ARM64)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "quarry-release-macos-latest"
+          shared-key: quarry-release-macos-latest
           save-if: false
+      - run: cargo build --release -p quarry-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quarry-build-macos-aarch64
+          path: target/release/quarry
+          if-no-files-found: error
+
+  package-linux-x86_64:
+    name: Package (Linux, x86_64, ${{ matrix.format }})
+    needs: build-linux-x86_64
+    environment: release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: deb
+            artifact_glob: "*.deb"
+          - format: appimage
+            artifact_glob: "*.AppImage"
+          - format: rpm
+            nfpm_arch: amd64
+            rpm_filename_arch: x86_64
+            artifact_glob: "*.rpm"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang mold libasound2-dev libdbus-1-dev libfontconfig1-dev \
+            libfreetype6-dev libvulkan-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfuse2
+      - uses: actions/download-artifact@v4
+        with:
+          name: quarry-build-linux-x86_64
+          path: target/release
+      - name: Make binary executable
+        run: chmod +x target/release/quarry
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.format != 'rpm'
+      - uses: taiki-e/install-action@v2
+        if: matrix.format != 'rpm'
+        with:
+          tool: cargo-packager
+      - uses: actions/setup-go@v5
+        if: matrix.format == 'rpm'
+        with:
+          go-version: stable
+      - name: Install nfpm
+        if: matrix.format == 'rpm'
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Package with cargo-packager
+        if: matrix.format != 'rpm'
+        working-directory: crates/quarry-app
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: cargo packager --release -f ${{ matrix.format }}
+      - name: Package RPM
+        if: matrix.format == 'rpm'
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          VERSION="$version" GOARCH="${{ matrix.nfpm_arch }}" \
+            nfpm package --packager rpm --config nfpm.yaml \
+              --target "dist/quarry-${version}-${{ matrix.rpm_filename_arch }}.rpm"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quarry-linux-x86_64-${{ matrix.format }}
+          path: |
+            dist/${{ matrix.artifact_glob }}
+            dist/*.sig
+          if-no-files-found: error
+
+  package-linux-aarch64:
+    name: Package (Linux, ARM64, ${{ matrix.format }})
+    needs: build-linux-aarch64
+    environment: release
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: deb
+            artifact_glob: "*.deb"
+          - format: appimage
+            artifact_glob: "*.AppImage"
+          - format: rpm
+            nfpm_arch: arm64
+            rpm_filename_arch: aarch64
+            artifact_glob: "*.rpm"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang mold libasound2-dev libdbus-1-dev libfontconfig1-dev \
+            libfreetype6-dev libvulkan-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfuse2
+      - uses: actions/download-artifact@v4
+        with:
+          name: quarry-build-linux-aarch64
+          path: target/release
+      - name: Make binary executable
+        run: chmod +x target/release/quarry
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.format != 'rpm'
+      - uses: taiki-e/install-action@v2
+        if: matrix.format != 'rpm'
+        with:
+          tool: cargo-packager
+      - uses: actions/setup-go@v5
+        if: matrix.format == 'rpm'
+        with:
+          go-version: stable
+      - name: Install nfpm
+        if: matrix.format == 'rpm'
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Package with cargo-packager
+        if: matrix.format != 'rpm'
+        working-directory: crates/quarry-app
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: cargo packager --release -f ${{ matrix.format }}
+      - name: Package RPM
+        if: matrix.format == 'rpm'
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          VERSION="$version" GOARCH="${{ matrix.nfpm_arch }}" \
+            nfpm package --packager rpm --config nfpm.yaml \
+              --target "dist/quarry-${version}-${{ matrix.rpm_filename_arch }}.rpm"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quarry-linux-aarch64-${{ matrix.format }}
+          path: |
+            dist/${{ matrix.artifact_glob }}
+            dist/*.sig
+          if-no-files-found: error
+
+  package-windows-x86_64:
+    name: Package (Windows, x86_64)
+    needs: build-windows-x86_64
+    environment: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-packager
+      - uses: actions/download-artifact@v4
+        with:
+          name: quarry-build-windows-x86_64
+          path: target/release
+      - name: Package with cargo-packager
+        working-directory: crates/quarry-app
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: cargo packager --release -f nsis
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quarry-windows-x86_64-nsis
+          path: |
+            dist/*.exe
+            dist/*.sig
+          if-no-files-found: error
 
+  package-macos-aarch64:
+    name: Package (macOS, ARM64)
+    needs: build-macos-aarch64
+    environment: release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager
+      - uses: actions/download-artifact@v4
+        with:
+          name: quarry-build-macos-aarch64
+          path: target/release
+      - name: Make binary executable
+        run: chmod +x target/release/quarry
       - run: scripts/package-macos.sh
         env:
           CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
           CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
-
+          QUARRY_PREBUILT_BINARY: "1"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: quarry-macOS
+          name: quarry-macos-aarch64
           path: |
             dist/*.dmg
             dist/*.app.tar.gz
@@ -105,40 +308,55 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [package, macos]
+    if: always()
+    needs:
+      - package-linux-x86_64
+      - package-linux-aarch64
+      - package-windows-x86_64
+      - package-macos-aarch64
     runs-on: ubuntu-latest
     steps:
-      # Full history: the notes are the commits since the previous tag
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: out
-          merge-multiple: true
-      # Update manifest the app reads from releases/latest/download/latest.json
       - name: Write latest.json
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
         run: |
-          cd out
+          if [ -z "$CARGO_PACKAGER_SIGN_PRIVATE_KEY" ]; then
+            echo "Skipping updater manifest because no signing key is configured."
+            exit 0
+          fi
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
-          platform() { # key, bundle file, format
-            jq -n --arg url "$base/$2" --arg sig "$(cat "$2.sig")" --arg format "$3" \
-              '{($ARGS.positional[0]): {url: $url, signature: $sig, format: $format}}' --args "$1"
+          asset() { find "out/$1" -type f -name "$2" -print -quit; }
+          platform() { # key, artifact directory, file pattern, format
+            file=$(asset "$2" "$3")
+            [ -n "$file" ] && [ -f "$file.sig" ] || return 0
+            jq -n --arg url "$base/${file##*/}" --arg sig "$(cat "$file.sig")" --arg format "$4" \
+              --arg key "$1" '{($key): {url: $url, signature: $sig, format: $format}}'
           }
-          {
-            platform macos-aarch64 Quarry.app.tar.gz app
-            platform linux-x86_64 "$(ls *.AppImage)" appimage
-            platform windows-x86_64 "$(ls *.exe)" nsis
-          } | jq -s --arg v "${GITHUB_REF_NAME#v}" \
-            '{version: $v, pub_date: (now | todate), platforms: add}' > latest.json
-          cat latest.json
+          platforms=$( {
+            platform macos-aarch64 quarry-macos-aarch64 'Quarry.app.tar.gz' app
+            platform linux-x86_64 quarry-linux-x86_64-appimage '*.AppImage' appimage
+            platform linux-aarch64 quarry-linux-aarch64-appimage '*.AppImage' appimage
+            platform windows-x86_64 quarry-windows-x86_64-nsis '*.exe' nsis
+          } | jq -s 'add // {}' )
+          if [ "$platforms" != "{}" ]; then
+            jq -n --arg v "${GITHUB_REF_NAME#v}" --argjson platforms "$platforms" \
+              '{version: $v, pub_date: (now | todate), platforms: $platforms}' > out/latest.json
+            cat out/latest.json
+          else
+            echo "No signed updater packages are available; publishing package assets without latest.json."
+          fi
 
-      # Release notes from conventional commits: feat → Features, fix/perf → Fixes; chore, docs, ci, build and site left out
       - name: Write release notes
         run: |
           prev=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
           range="${prev:+$prev..}$GITHUB_REF_NAME"
-          section() { # title, types regex
+          section() {
             lines=$(git log --no-merges --reverse --format='%s' "$range" \
               | grep -E "^($2)(\([^)]*\))?!?: " | grep -vE '^[a-z]+\(site\)' \
               | sed -E 's/^[a-z]+(\(([^)]*)\))?!?: (.*)/\3 (\2)/; s/ \(\)$//' \
@@ -152,16 +370,29 @@ jobs:
             [ -n "$prev" ] && echo "**Full changelog:** https://github.com/$GITHUB_REPOSITORY/compare/$prev...$GITHUB_REF_NAME"
             true
           } > notes.md
-          cat notes.md
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        # Suffixed tags (v1.2.0-beta.1) are pre-releases, which releases/latest (and so the updater) skips
         run: |
           pre=""
           case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" out/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Quarry $GITHUB_REF_NAME" \
-            --notes-file notes.md $pre
+          mapfile -d '' -t assets < <(find out -type f \( \
+            -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' -o \
+            -name '*.exe' -o -name '*.dmg' -o -name '*.app.tar.gz' -o \
+            -name '*.sig' \) -print0 | sort -z)
+          [ ! -f out/latest.json ] || assets+=(out/latest.json)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No package assets were produced."
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "Quarry $GITHUB_REF_NAME" --notes-file notes.md $pre
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Quarry $GITHUB_REF_NAME" \
+              --notes-file notes.md $pre
+          fi

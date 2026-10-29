@@ -1,0 +1,35 @@
+name: quarry
+arch: ${GOARCH}
+platform: linux
+version: ${VERSION}
+release: 1
+section: Development/Tools
+priority: optional
+maintainer: Krishna
+description: Desktop SQL client for working with databases
+vendor: TheKodeKing
+homepage: https://github.com/thekodeking/quarry
+license: GPL-3.0-or-later
+depends:
+  - alsa-lib
+  - dbus-libs
+  - fontconfig
+  - freetype
+  - libX11
+  - libX11-xcb
+  - libwayland-client
+  - libxcb
+  - libxkbcommon
+  - libxkbcommon-x11
+  - vulkan-loader
+contents:
+  - src: target/release/quarry
+    dst: /usr/bin/quarry
+    file_info:
+      mode: 0755
+  - src: scripts/quarry.desktop
+    dst: /usr/share/applications/quarry.desktop
+  - src: assets/icon/quarry-128.png
+    dst: /usr/share/icons/hicolor/128x128/apps/quarry.png
+  - src: assets/icon/quarry-256.png
+    dst: /usr/share/icons/hicolor/256x256/apps/quarry.png

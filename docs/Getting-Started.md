@@ -5,7 +5,11 @@ Let's get from zero to a query result. We'll use SQLite, because it needs nothin
 ## Install
 
 Grab a build from [Releases](https://github.com/thekodeking/quarry/releases): a `.dmg` for macOS,
-`.deb` or `.AppImage` for Linux, an installer for Windows.
+`.deb`, `.AppImage`, or `.rpm` for Linux (x86_64 or ARM64), or an installer for Windows. On Fedora, install the matching RPM with:
+
+```sh
+sudo dnf install ./quarry-*.rpm
+```
 
 On macOS the app is ad-hoc signed, not notarized, so Gatekeeper will refuse it the first time.
 Tell it you mean it:
