@@ -166,7 +166,6 @@ jobs:
             nfpm package --packager rpm --config nfpm.yaml \
               --target "dist/quarry-${version}-${{ matrix.rpm_filename_arch }}.rpm"
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: quarry-linux-x86_64-${{ matrix.format }}
           path: |
@@ -237,7 +236,6 @@ jobs:
             nfpm package --packager rpm --config nfpm.yaml \
               --target "dist/quarry-${version}-${{ matrix.rpm_filename_arch }}.rpm"
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: quarry-linux-aarch64-${{ matrix.format }}
           path: |
@@ -267,7 +265,6 @@ jobs:
           CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
         run: cargo packager --release -f nsis
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: quarry-windows-x86_64-nsis
           path: |
@@ -298,7 +295,6 @@ jobs:
           CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
           QUARRY_PREBUILT_BINARY: "1"
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: quarry-macos-aarch64
           path: |
@@ -308,7 +304,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: always()
+    if: ${{ !cancelled() }}
     needs:
       - package-linux-x86_64
       - package-linux-aarch64
@@ -371,12 +367,30 @@ jobs:
             true
           } > notes.md
 
+      - name: Check package jobs
+        id: packages
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          complete=$(jq -r '[.[] | .result] | all(. == "success")' <<< "$NEEDS")
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           pre=""
-          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          # Pre-releases may publish whatever platforms succeeded.
+          # Stable releases require every package job to pass; otherwise keep the release as a draft.
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            pre="--prerelease"
+            draft="--draft=false"
+          elif [ "${{ steps.packages.outputs.complete }}" = "true" ]; then
+            draft="--draft=false"
+          else
+            draft="--draft"
+            echo "::warning::Not every package job succeeded; creating $GITHUB_REF_NAME as a draft."
+          fi
           mapfile -d '' -t assets < <(find out -type f \( \
             -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' -o \
             -name '*.exe' -o -name '*.dmg' -o -name '*.app.tar.gz' -o \
@@ -389,10 +403,10 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
             gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --title "Quarry $GITHUB_REF_NAME" --notes-file notes.md $pre
+              --title "Quarry $GITHUB_REF_NAME" --notes-file notes.md $pre $draft
           else
             gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --title "Quarry $GITHUB_REF_NAME" \
-              --notes-file notes.md $pre
+              --notes-file notes.md $pre $draft
           fi
