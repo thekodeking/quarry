@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +55,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - run: |
-          for os in ubuntu-latest windows-latest macos-latest; do
+          for os in ubuntu-24.04 ubuntu-24.04-arm windows-latest macos-latest; do
             gh cache list --key "v0-rust-quarry-release-$os-" --sort created_at --order desc --limit 100 \
               --json id -q '.[1:][].id' | xargs -r -n1 gh cache delete
           done

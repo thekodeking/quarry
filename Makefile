@@ -49,8 +49,10 @@ ifneq ($(OS),$(HOST_OS))
 else ifeq ($(OS),macos)
 	./scripts/package-macos.sh
 else ifeq ($(OS),linux)
+	cargo build --release -p quarry-app
 	cd crates/quarry-app && cargo packager --release -f deb -f appimage
 else ifeq ($(OS),windows)
+	cargo build --release -p quarry-app
 	cd crates/quarry-app && cargo packager --release -f nsis
 else
 	$(error OS must be macos, linux or windows)

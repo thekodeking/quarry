@@ -712,6 +712,30 @@ h2 {
   align-items: center;
 }
 
+.dl-arch-select {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  margin-top: var(--space-xs);
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+
+.dl-arch-select select {
+  min-height: 32px;
+  padding: 4px 28px 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font: 500 12px var(--font-body);
+}
+
+.dl-arch-select select:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
 .dl-file {
   display: flex;
   align-items: center;
@@ -1207,7 +1231,12 @@ footer {
       <li class="dl-row" data-os="linux">
         <div class="dl-os">
           <h3>Linux <span class="dl-yours" hidden>Your system</span></h3>
-          <p>x86_64</p>
+          <label class="dl-arch-select">Architecture
+            <select id="linux-arch-select" aria-label="Linux architecture">
+              <option value="x86_64">x86_64 (AMD64)</option>
+              <option value="aarch64">ARM64 (aarch64)</option>
+            </select>
+          </label>
         </div>
         <div class="dl-files">
           <div class="dl-file" data-asset-ext=".deb">
@@ -1217,6 +1246,10 @@ footer {
           <div class="dl-file" data-asset-ext=".AppImage">
             <a class="btn" href="https://github.com/thekodeking/quarry/releases" target="_blank" rel="noopener noreferrer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download AppImage</a>
             <span class="dl-meta">Any distribution <span class="dl-size"></span></span>
+          </div>
+          <div class="dl-file" data-asset-ext=".rpm">
+            <a class="btn" href="https://github.com/thekodeking/quarry/releases" target="_blank" rel="noopener noreferrer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download .rpm</a>
+            <span class="dl-meta">Fedora, RHEL <span class="dl-size"></span></span>
           </div>
           <p class="dl-note">Make the AppImage executable before running it: <code>chmod +x Quarry*.AppImage</code></p>
           <p class="dl-pending" hidden>Not released yet.</p>
@@ -1336,6 +1369,38 @@ open dist/Quarry-*.dmg</code></pre>
     myRow.querySelector('.btn').classList.add('btn-primary');
   }
 
+  const linuxRow = document.querySelector('.dl-row[data-os="linux"]');
+  const linuxArchSelect = document.getElementById('linux-arch-select');
+  const armDevice = /aarch64|arm64|armv8l/i.test(`${navigator.platform} ${navigator.userAgent}`)
+    || (navigator.userAgentData?.architecture === 'arm' && navigator.userAgentData?.bitness === '64');
+  let linuxArch = armDevice ? 'aarch64' : 'x86_64';
+  let releaseAssets = [];
+
+  function setLinuxArch(arch) {
+    linuxArch = arch;
+    linuxArchSelect.value = arch;
+    if (releaseAssets.length) updateLinuxDownloads();
+  }
+
+  function updateLinuxDownloads() {
+    const archPattern = linuxArch === 'aarch64' ? /aarch64|arm64/i : /x86_64|amd64|x64/i;
+    let foundAsset = false;
+    linuxRow.querySelectorAll('[data-asset-ext]').forEach(slot => {
+      const asset = releaseAssets.find(item => item.name.endsWith(slot.dataset.assetExt) && archPattern.test(item.name));
+      slot.hidden = !asset;
+      if (!asset) return;
+      foundAsset = true;
+      const link = slot.querySelector('a');
+      link.href = asset.browser_download_url;
+      link.removeAttribute('target');
+      slot.querySelector('.dl-size').textContent = new Intl.NumberFormat(undefined, { style: 'unit', unit: 'megabyte', maximumFractionDigits: 1 }).format(asset.size / 1e6);
+    });
+    linuxRow.querySelector('.dl-pending').hidden = foundAsset;
+  }
+
+  linuxArchSelect.addEventListener('change', () => setLinuxArch(linuxArchSelect.value));
+  setLinuxArch(linuxArch);
+
   async function fetchLatestRelease() {
     const status = document.getElementById('release-status');
     try {
@@ -1353,6 +1418,7 @@ open dist/Quarry-*.dmg</code></pre>
       status.textContent = `Latest: ${latest.tag_name}${latest.prerelease ? ' (pre-release)' : ''}`;
       const fmt = new Intl.NumberFormat(undefined, { style: 'unit', unit: 'megabyte', maximumFractionDigits: 1 });
       document.querySelectorAll('[data-asset-ext]').forEach(slot => {
+        if (slot.closest('.dl-row')?.dataset.os === 'linux') return;
         const asset = (latest.assets || []).find(a => a.name.endsWith(slot.dataset.assetExt));
         if (!asset) return;
         const link = slot.querySelector('a');
@@ -1360,6 +1426,8 @@ open dist/Quarry-*.dmg</code></pre>
         link.removeAttribute('target');
         slot.querySelector('.dl-size').textContent = fmt.format(asset.size / 1e6);
       });
+      releaseAssets = latest.assets || [];
+      updateLinuxDownloads();
     } catch (err) {
       // Offline or rate-limited: the buttons still open the Releases page
       status.textContent = 'Downloads open the GitHub Releases page.';
