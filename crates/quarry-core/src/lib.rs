@@ -24,6 +24,7 @@
 
 pub mod conformance;
 pub mod conn_url;
+pub mod ddl;
 pub mod dialect;
 pub mod diff;
 pub mod driver;
