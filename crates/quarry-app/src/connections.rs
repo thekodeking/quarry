@@ -18,16 +18,32 @@ type Vault = std::collections::HashMap<String, String>;
 /// The vault, read from the keychain on first use and kept for the rest of the launch
 static VAULT: std::sync::Mutex<Option<Vault>> = std::sync::Mutex::new(None);
 
+fn load_vault_checked() -> Result<Vault, String> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, VAULT_ACCOUNT)
+        .map_err(|e| format!("Keychain unavailable: {e}"))?;
+    match entry.get_password() {
+        Ok(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
+        Err(keyring::Error::NoEntry) => Ok(Vault::default()),
+        Err(e) => Err(format!(
+            "Keychain access denied or failed ({e}). Allow Quarry in Keychain Access or re-enter your password."
+        )),
+    }
+}
+
 fn with_vault<R>(f: impl FnOnce(&mut Vault) -> R) -> R {
     let mut guard = VAULT.lock().unwrap_or_else(|e| e.into_inner());
-    let vault = guard.get_or_insert_with(|| {
-        keyring::Entry::new(KEYCHAIN_SERVICE, VAULT_ACCOUNT)
-            .and_then(|e| e.get_password())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    });
+    let vault = guard.get_or_insert_with(|| load_vault_checked().unwrap_or_default());
     f(vault)
+}
+
+fn try_with_vault<R>(f: impl FnOnce(&mut Vault) -> R) -> Result<R, String> {
+    let mut guard = VAULT.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        // Do not cache a denied/failed Keychain read so subsequent Connect clicks can re-prompt.
+        let loaded = load_vault_checked()?;
+        *guard = Some(loaded);
+    }
+    Ok(f(guard.as_mut().unwrap()))
 }
 
 fn store_vault(vault: &Vault) -> Result<(), String> {
@@ -120,6 +136,13 @@ pub fn save(profiles: &[ConnectionProfile]) -> Result<(), String> {
         if let Some(secret) = secret {
             secrets.push((p.id.clone(), secret));
         }
+        if let Some(ssh) = &p.ssh {
+            if let Some(ssh_secret) = &ssh.secret {
+                if !ssh_secret.is_empty() {
+                    secrets.push((format!("{}:ssh", p.id), ssh_secret.clone()));
+                }
+            }
+        }
         stored.push(ConnectionProfile {
             path_or_url,
             ..p.clone()
@@ -183,46 +206,88 @@ pub fn display_address(p: &ConnectionProfile) -> String {
 }
 
 pub fn forget_secret(id: &str) {
+    let ssh_key = format!("{id}:ssh");
     if !USE_VAULT {
-        return delete_legacy_secret(id);
+        delete_legacy_secret(id);
+        delete_legacy_secret(&ssh_key);
+        return;
     }
     with_vault(|vault| {
+        let mut changed = false;
         if vault.remove(id).is_some() {
+            changed = true;
+        }
+        if vault.remove(&ssh_key).is_some() {
+            changed = true;
+        }
+        if changed {
             let _ = store_vault(vault);
         }
     });
     delete_legacy_secret(id);
+    delete_legacy_secret(&ssh_key);
+}
+
+pub fn ssh_secret(id: &str) -> Option<String> {
+    let key = format!("{id}:ssh");
+    if !USE_VAULT {
+        legacy_secret(&key)
+    } else {
+        with_vault(|vault| vault.get(&key).cloned().or_else(|| legacy_secret(&key)))
+    }
 }
 
 /// Returns the connection string with its keychain password restored (if one is stored).
+/// Exports connection profiles as sanitized JSON (passwords stripped) for sharing.
+pub fn export_sanitized_profiles(profiles: &[ConnectionProfile]) -> Result<String, String> {
+    let sanitized: Vec<ConnectionProfile> = profiles
+        .iter()
+        .map(|p| {
+            let mut copy = p.clone();
+            if let Some(driver) = copy.driver() {
+                copy.path_or_url = driver.take_secret(&copy.path_or_url).0;
+            }
+            copy
+        })
+        .collect();
+    serde_json::to_string_pretty(&sanitized).map_err(|e| e.to_string())
+}
+
+/// Imports connection profiles from sanitized JSON.
+pub fn import_sanitized_profiles(json: &str) -> Result<Vec<ConnectionProfile>, String> {
+    serde_json::from_str(json).map_err(|e| e.to_string())
+}
+
 pub fn with_secret(profile: &ConnectionProfile) -> String {
+    try_with_secret(profile).unwrap_or_else(|_| profile.path_or_url.clone())
+}
+
+pub fn try_with_secret(profile: &ConnectionProfile) -> Result<String, String> {
     let Some(driver) = profile.driver() else {
-        return profile.path_or_url.clone();
+        return Ok(profile.path_or_url.clone());
     };
     if driver.take_secret(&profile.path_or_url).1.is_some() {
-        return profile.path_or_url.clone();
+        return Ok(profile.path_or_url.clone());
     }
     let secret = if !USE_VAULT {
         legacy_secret(&profile.id)
     } else {
-        with_vault(|vault| {
+        try_with_vault(|vault| {
             if let Some(s) = vault.get(&profile.id) {
                 return Some(s.clone());
             }
-            // First use since the vault: move the old per-connection item into it
-            // (the old item goes only once the vault holds it)
             let s = legacy_secret(&profile.id)?;
             vault.insert(profile.id.clone(), s.clone());
             if store_vault(vault).is_ok() {
                 delete_legacy_secret(&profile.id);
             }
             Some(s)
-        })
+        })?
     };
-    match secret {
+    Ok(match secret {
         Some(secret) => driver.put_secret(&profile.path_or_url, &secret),
         None => profile.path_or_url.clone(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -240,6 +305,7 @@ mod tests {
             read_only: false,
             ssh: None,
             statement_timeout_secs: None,
+            ssl: None,
         }
     }
 

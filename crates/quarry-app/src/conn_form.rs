@@ -8,7 +8,12 @@ use super::*;
 impl QuarryWindow {
     pub fn refresh_ssh_discovery(&mut self) {
         self.state.ssh_discovered_hosts = crate::ssh::discover_ssh_hosts();
-        self.state.ssh_agent_keys = crate::ssh::check_ssh_agent_keys().unwrap_or_default();
+        let status = crate::ssh::check_ssh_agent_status();
+        self.state.ssh_agent_keys = match &status {
+            crate::ssh::SshAgentStatus::Loaded(keys) => keys.clone(),
+            _ => Vec::new(),
+        };
+        self.state.ssh_agent_status = status;
     }
 
     /// The Add Connection modal, filled in from a saved connection; saving keeps its id (and keychain password)
@@ -39,16 +44,18 @@ impl QuarryWindow {
         }
         self.set_conn_inputs(Some(&p.name), &path, window, cx);
         let ssh = p.ssh.as_ref();
+        if let Some(s) = ssh {
+            self.state.add_conn_ssh_auth = s.effective_auth_mode();
+        } else {
+            self.state.add_conn_ssh_auth = crate::ssh::SshAuthMode::Agent;
+        }
         let values = [
-            ssh.map(|s| {
-                if s.port == 22 {
-                    s.host.clone()
-                } else {
-                    format!("{}:{}", s.host, s.port)
-                }
-            }),
+            ssh.map(|s| s.host.clone()),
+            ssh.map(|s| s.port.to_string()),
             ssh.map(|s| s.user.clone()),
             ssh.and_then(|s| s.key_path.clone()),
+            None, // secret left blank: blank keeps saved secret
+            ssh.and_then(|s| s.jump_host.clone()),
         ];
         for (input, v) in self.ssh_inputs.clone().iter().zip(values) {
             input.update(cx, |i, cx| i.set_value(v.unwrap_or_default(), window, cx));
@@ -71,6 +78,10 @@ impl QuarryWindow {
         self.state.add_conn_tab = 0;
         self.state.add_conn_read_only = false;
         self.state.add_conn_ssh = false;
+        self.state.add_conn_ssh_auth = crate::ssh::SshAuthMode::Agent;
+        for input in &self.ssh_inputs {
+            input.update(cx, |i, cx| i.set_value(String::new(), window, cx));
+        }
         // A fresh form starts on the driver's usual local defaults (host, port, user, database),
         // so only what differs needs typing. Never a password: that's always typed
         self.set_conn_driver(self.state.add_conn_driver, window, cx);
@@ -207,6 +218,7 @@ impl QuarryWindow {
             env: self.state.add_conn_env,
             read_only: self.state.add_conn_read_only,
             ssh: self.ssh_from_modal(cx),
+            ssl: None,
             statement_timeout_secs: self.timeout_input.read(cx).value().trim().parse().ok(),
         }
     }
@@ -220,14 +232,25 @@ impl QuarryWindow {
         {
             return None;
         }
-        let [host, user, key] = &self.ssh_inputs;
+        let [host, port, user, key, secret, jump_host] = &self.ssh_inputs;
         let host = host.read(cx).value().trim().to_string();
-        let (host, port) = match host.rsplit_once(':') {
-            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap_or(22)),
-            _ => (host, 22),
+        let port_str = port.read(cx).value().trim().to_string();
+        let (host, port) = if let Ok(p) = port_str.parse::<u16>() {
+            (host, p)
+        } else {
+            match host.rsplit_once(':') {
+                Some((h, p)) if p.parse::<u16>().is_ok() => {
+                    (h.to_string(), p.parse().unwrap_or(22))
+                }
+                _ => (host, 22),
+            }
         };
         let user = user.read(cx).value().trim().to_string();
         let key = key.read(cx).value().trim().to_string();
+        let secret = secret.read(cx).value().trim().to_string();
+        let jump_host = jump_host.read(cx).value().trim().to_string();
+        let auth_mode = self.state.add_conn_ssh_auth;
+
         (!host.is_empty()).then(|| ssh::SshConfig {
             host,
             port,
@@ -236,15 +259,23 @@ impl QuarryWindow {
             } else {
                 user
             },
+            auth_mode,
             key_path: (!key.is_empty()).then_some(key),
+            jump_host: (!jump_host.is_empty()).then_some(jump_host),
+            secret: (!secret.is_empty()).then_some(secret),
         })
     }
 
     /// Connects to a new database using values in the Add Connection modal
     pub fn connect_add_conn_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let profile = self.profile_from_modal(cx);
+        let mut profile = self.profile_from_modal(cx);
         // Editing: replace the saved profile in place and reconnect with the new settings
         if let Some(id) = self.state.editing_conn.take() {
+            if let Some(ref mut ssh) = profile.ssh {
+                if ssh.secret.is_none() {
+                    ssh.secret = crate::connections::ssh_secret(&id);
+                }
+            }
             self.state.disconnect(&id);
             if let Some(slot) = self.state.saved_connections.iter_mut().find(|c| c.id == id) {
                 *slot = profile.clone();
@@ -412,7 +443,14 @@ impl QuarryWindow {
 
     /// Tests connection parameters
     pub fn test_add_conn_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let profile = self.profile_from_modal(cx);
+        let mut profile = self.profile_from_modal(cx);
+        if let Some(ref id) = self.state.editing_conn {
+            if let Some(ref mut ssh) = profile.ssh {
+                if ssh.secret.is_none() {
+                    ssh.secret = crate::connections::ssh_secret(id);
+                }
+            }
+        }
         self.state.add_conn_feedback = Some(("Testing…".to_string(), false));
         cx.notify();
 
@@ -491,7 +529,7 @@ impl QuarryWindow {
             };
             this.update_in(cx, |this, window, cx| {
                 let path_str = path.to_string_lossy().to_string();
-                if let Some(key_input) = this.ssh_inputs.get(2) {
+                if let Some(key_input) = this.ssh_inputs.get(3) {
                     key_input.update(cx, |i, cx| {
                         i.set_value(path_str, window, cx);
                     });
@@ -519,32 +557,75 @@ impl QuarryWindow {
 
         let Some(entry) = entry else { return };
 
-        let host_val = if let Some(p) = entry.port {
-            if p != 22 {
-                format!("{}:{}", entry.alias, p)
-            } else {
-                entry.alias.clone()
-            }
-        } else {
-            entry.alias.clone()
-        };
+        let host_val = entry.hostname.unwrap_or_else(|| entry.alias.clone());
+        let port_val = entry
+            .port
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "22".to_string());
 
-        if let Some(input) = self.ssh_inputs.get(0) {
+        if let Some(input) = self.ssh_inputs.first() {
             input.update(cx, |i, cx| i.set_value(host_val, window, cx));
         }
 
+        if let Some(input) = self.ssh_inputs.get(1) {
+            input.update(cx, |i, cx| i.set_value(port_val, window, cx));
+        }
+
         if let Some(user) = entry.user {
-            if let Some(input) = self.ssh_inputs.get(1) {
+            if let Some(input) = self.ssh_inputs.get(2) {
                 input.update(cx, |i, cx| i.set_value(user, window, cx));
             }
         }
 
         if let Some(key) = entry.identity_file {
-            if let Some(input) = self.ssh_inputs.get(2) {
+            self.state.add_conn_ssh_auth = crate::ssh::SshAuthMode::Key;
+            if let Some(input) = self.ssh_inputs.get(3) {
                 input.update(cx, |i, cx| i.set_value(key, window, cx));
             }
         }
 
+        if let Some(jump) = entry.proxy_jump {
+            if let Some(input) = self.ssh_inputs.get(5) {
+                input.update(cx, |i, cx| i.set_value(jump, window, cx));
+            }
+        }
+
         cx.notify();
+    }
+
+    /// Tests whether the configured SSH tunnel can connect to the target host and port
+    pub fn test_ssh_tunnel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cfg) = self.ssh_from_modal(cx) else {
+            self.state.add_conn_feedback = Some(("Please enter an SSH host".to_string(), true));
+            cx.notify();
+            return;
+        };
+
+        let url = self.conn_path_input.read(cx).value().trim().to_string();
+        let (target_host, target_port) = self
+            .conn_driver()
+            .tunnel_target(&url)
+            .unwrap_or(("127.0.0.1".to_string(), 22));
+
+        self.state.add_conn_feedback = Some(("Testing SSH tunnel…".to_string(), false));
+        cx.notify();
+
+        run_db(
+            window,
+            cx,
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    crate::ssh::Tunnel::test_connection(&cfg, &target_host, target_port)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+            |this, res, _window, _cx| {
+                this.state.add_conn_feedback = Some(match res {
+                    Ok(()) => ("SSH tunnel connected successfully".to_string(), false),
+                    Err(e) => (e, true),
+                });
+            },
+        );
     }
 }

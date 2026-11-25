@@ -8,13 +8,45 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SshAuthMode {
+    #[default]
+    Agent,
+    Key,
+    Password,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SshConfig {
     pub host: String,
     pub port: u16,
     pub user: String,
-    /// Private key file; `None` uses ssh-agent / ~/.ssh config
+    #[serde(default)]
+    pub auth_mode: SshAuthMode,
+    /// Private key file; used for Key mode
+    #[serde(default)]
     pub key_path: Option<String>,
+    /// Optional jump host / bastion hop (-J jump.example.com)
+    #[serde(default)]
+    pub jump_host: Option<String>,
+    /// Password or key passphrase; not saved to connections.json (saved to Keychain)
+    #[serde(skip)]
+    pub secret: Option<String>,
+}
+
+impl SshConfig {
+    pub fn effective_auth_mode(&self) -> SshAuthMode {
+        if self.auth_mode == SshAuthMode::Agent
+            && self
+                .key_path
+                .as_ref()
+                .is_some_and(|k| !k.trim().is_empty())
+        {
+            SshAuthMode::Key
+        } else {
+            self.auth_mode
+        }
+    }
 }
 
 /// A running `ssh -L`; the process is stopped when this is dropped
@@ -31,6 +63,11 @@ impl Drop for Tunnel {
 }
 
 impl Tunnel {
+    /// Returns true if the background ssh process is still running
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     /// Forwards a free local port to `remote_host:remote_port` as seen from the SSH server.
     /// Retries up to 3 times to prevent transient port allocation race conditions (TOCTOU).
     pub fn open(cfg: &SshConfig, remote_host: &str, remote_port: u16) -> Result<Tunnel, String> {
@@ -47,6 +84,12 @@ impl Tunnel {
         Err(last_err)
     }
 
+    /// Tests whether an SSH tunnel can be established to the remote target.
+    pub fn test_connection(cfg: &SshConfig, remote_host: &str, remote_port: u16) -> Result<(), String> {
+        let _tunnel = Self::open(cfg, remote_host, remote_port)?;
+        Ok(())
+    }
+
     fn try_open(cfg: &SshConfig, remote_host: &str, remote_port: u16) -> Result<Tunnel, String> {
         let local_port = TcpListener::bind("127.0.0.1:0")
             .and_then(|l| l.local_addr())
@@ -58,17 +101,55 @@ impl Tunnel {
             "-L",
             &format!("127.0.0.1:{local_port}:{remote_host}:{remote_port}"),
         ])
-        .args(["-p", &cfg.port.to_string()])
-        // Never prompt (passphrase keys must be in ssh-agent); fail fast if the forward can't be set up
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "ServerAliveInterval=30",
-        ])
-        .args([
+        .args(["-p", &cfg.port.to_string()]);
+
+        let auth_mode = cfg.effective_auth_mode();
+        let has_secret = cfg
+            .secret
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+
+        if has_secret {
+            if let Ok(exe) = std::env::current_exe() {
+                cmd.env("SSH_ASKPASS", exe);
+                cmd.env("SSH_ASKPASS_REQUIRE", "force");
+                cmd.env("DISPLAY", "dummy:0");
+                cmd.env("QUARRY_SSH_ASKPASS", "1");
+                if auth_mode == SshAuthMode::Password {
+                    cmd.env("QUARRY_SSH_PASSWORD", cfg.secret.as_deref().unwrap_or(""));
+                } else {
+                    cmd.env("QUARRY_SSH_PASSPHRASE", cfg.secret.as_deref().unwrap_or(""));
+                }
+            }
+            cmd.args([
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "TCPKeepAlive=yes",
+            ]);
+        } else {
+            cmd.args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "TCPKeepAlive=yes",
+            ]);
+        }
+
+        cmd.args([
             "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",
@@ -77,9 +158,28 @@ impl Tunnel {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-        if let Some(key) = cfg.key_path.as_deref().filter(|k| !k.trim().is_empty()) {
-            cmd.args(["-i", &expand_home(key), "-o", "IdentitiesOnly=yes"]);
+
+        if let Some(jump) = cfg.jump_host.as_deref().filter(|j| !j.trim().is_empty()) {
+            cmd.args(["-J", jump.trim()]);
         }
+
+        match auth_mode {
+            SshAuthMode::Key => {
+                if let Some(key) = cfg.key_path.as_deref().filter(|k| !k.trim().is_empty()) {
+                    cmd.args(["-i", &expand_home(key), "-o", "IdentitiesOnly=yes"]);
+                }
+            }
+            SshAuthMode::Password => {
+                cmd.args([
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    "-o",
+                    "PasswordAuthentication=yes",
+                ]);
+            }
+            SshAuthMode::Agent => {}
+        }
+
         cmd.arg(format!("{}@{}", cfg.user, cfg.host));
         let mut child = cmd.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => "ssh isn't installed or isn't on PATH".to_string(),
@@ -93,7 +193,13 @@ impl Tunnel {
                 if let Some(mut stderr) = child.stderr.take() {
                     let _ = std::io::Read::read_to_string(&mut stderr, &mut err);
                 }
-                return Err(format!("SSH tunnel failed: {}", err.trim()));
+                let err_trimmed = err.trim();
+                let clean_err = if err_trimmed.is_empty() {
+                    "Connection closed by server".to_string()
+                } else {
+                    clean_ssh_error(err_trimmed)
+                };
+                return Err(format!("SSH tunnel failed: {clean_err}"));
             }
             if TcpStream::connect(("127.0.0.1", local_port)).is_ok() {
                 watch(std::process::id(), child.id());
@@ -164,6 +270,7 @@ pub struct DiscoveredSshHost {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<String>,
+    pub proxy_jump: Option<String>,
 }
 
 /// Discovers configured servers from `~/.ssh/config` (including `Include` directives)
@@ -220,6 +327,7 @@ fn parse_ssh_config_file(
                             user: None,
                             port: None,
                             identity_file: None,
+                            proxy_jump: None,
                         });
                         current_indices.push(idx);
                     }
@@ -284,6 +392,11 @@ fn parse_ssh_config_file(
                                 entry.identity_file = Some(v.to_string());
                             }
                         }
+                        "proxyjump" => {
+                            if entry.proxy_jump.is_none() {
+                                entry.proxy_jump = Some(v.to_string());
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -324,35 +437,238 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     dp[pat_chars.len()][text_chars.len()]
 }
 
-/// Checks if ssh-agent has any keys loaded (`ssh-add -l`), returning key comments / identifiers if available
-pub fn check_ssh_agent_keys() -> Option<Vec<String>> {
-    let output = quarry_core::command("ssh-add")
-        .arg("-l")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+fn clean_ssh_error(err: &str) -> String {
+    let lines: Vec<&str> = err
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("Warning:"))
+        .collect();
+    if lines.is_empty() {
+        err.to_string()
+    } else {
+        lines.join("; ")
+    }
+}
 
-    if !output.status.success() {
-        return None;
+/// The state of the local SSH authentication agent
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshAgentStatus {
+    Loaded(Vec<String>),
+    Empty,
+    Unavailable(String),
+}
+
+/// Discovers and normalizes SSH agent socket and PATH in the process environment
+pub fn init_ssh_env() {
+    #[cfg(unix)]
+    {
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let mut paths: Vec<&str> = current_path.split(':').collect();
+        let candidates = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/sbin",
+        ];
+        let mut added = false;
+        let mut new_path = current_path.clone();
+        for candidate in candidates {
+            if std::path::Path::new(candidate).exists() && !paths.contains(&candidate) {
+                if !new_path.is_empty() {
+                    new_path.push(':');
+                }
+                new_path.push_str(candidate);
+                paths.push(candidate);
+                added = true;
+            }
+        }
+        if added {
+            std::env::set_var("PATH", new_path);
+        }
     }
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut keys = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            // ssh-add -l output typically: "256 SHA256:... user@host (ED25519)"
-            // Extract comment or show line
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 3 {
-                let comment = parts[2..].join(" ");
-                keys.push(comment);
-            } else {
-                keys.push(trimmed.to_string());
+    let sock_valid = std::env::var("SSH_AUTH_SOCK")
+        .ok()
+        .map(|s| !s.is_empty() && std::path::Path::new(&s).exists())
+        .unwrap_or(false);
+
+    if !sock_valid {
+        if let Some(sock) = probe_ssh_agent_socket() {
+            tracing::info!("Configured SSH agent socket: {sock}");
+            std::env::set_var("SSH_AUTH_SOCK", sock);
+        }
+    }
+}
+
+fn probe_ssh_agent_socket() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let p1 = expand_home("~/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock");
+        if std::path::Path::new(&p1).exists() {
+            return Some(p1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let p1 = expand_home("~/.1password/agent.sock");
+        if std::path::Path::new(&p1).exists() {
+            return Some(p1);
+        }
+    }
+
+    let gpg_sock = expand_home("~/.gnupg/S.gpg-agent.ssh");
+    if std::path::Path::new(&gpg_sock).exists() {
+        return Some(gpg_sock);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            for sub in &["gcr/ssh", "keyring/ssh", "openssh_agent"] {
+                let p = format!("{runtime_dir}/{sub}");
+                if std::path::Path::new(&p).exists() {
+                    return Some(p);
+                }
             }
         }
     }
-    Some(keys)
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(entries) = std::fs::read_dir("/private/tmp") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("com.apple.launchd.") {
+                    let listeners = entry.path().join("Listeners");
+                    if listeners.exists() {
+                        return Some(listeners.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if let Ok(shell) = std::env::var("SHELL") {
+            if let Ok(output) = std::process::Command::new(&shell)
+                .args(["-l", "-c", "echo -n \"$SSH_AUTH_SOCK\""])
+                .output()
+            {
+                if output.status.success() {
+                    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !s.is_empty() && std::path::Path::new(&s).exists() {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Checks the state of ssh-agent and any loaded keys
+pub fn check_ssh_agent_status() -> SshAgentStatus {
+    let output = match quarry_core::command("ssh-add")
+        .arg("-l")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => return SshAgentStatus::Unavailable(e.to_string()),
+    };
+
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut keys = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    let comment = parts[2..].join(" ");
+                    keys.push(comment);
+                } else {
+                    keys.push(trimmed.to_string());
+                }
+            }
+        }
+        if keys.is_empty() {
+            SshAgentStatus::Empty
+        } else {
+            SshAgentStatus::Loaded(keys)
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{stdout} {stderr}").to_lowercase();
+        if combined.contains("no identities")
+            || (output.status.code() == Some(1) && !combined.contains("could not open"))
+        {
+            SshAgentStatus::Empty
+        } else {
+            let err = stderr.trim();
+            SshAgentStatus::Unavailable(if err.is_empty() {
+                "Agent unavailable".to_string()
+            } else {
+                err.to_string()
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ssh_config_backwards_compatible() {
+        // Old config format with key_path
+        let json_with_key = r#"{"host":"bastion.example.com","port":22,"user":"root","key_path":"~/.ssh/id_rsa"}"#;
+        let cfg: SshConfig = serde_json::from_str(json_with_key).unwrap();
+        assert_eq!(cfg.effective_auth_mode(), SshAuthMode::Key);
+        assert_eq!(cfg.port, 22);
+        assert_eq!(cfg.user, "root");
+        assert_eq!(cfg.jump_host, None);
+
+        // Old config format without key_path
+        let json_agent = r#"{"host":"bastion.example.com","port":2222,"user":"ubuntu"}"#;
+        let cfg: SshConfig = serde_json::from_str(json_agent).unwrap();
+        assert_eq!(cfg.effective_auth_mode(), SshAuthMode::Agent);
+        assert_eq!(cfg.port, 2222);
+
+        // New config format with explicit password auth and jump_host
+        let json_password = r#"{"host":"bastion.example.com","port":22,"user":"admin","auth_mode":"Password","jump_host":"jump.corp.com:2222"}"#;
+        let mut cfg: SshConfig = serde_json::from_str(json_password).unwrap();
+        assert_eq!(cfg.effective_auth_mode(), SshAuthMode::Password);
+        assert_eq!(cfg.jump_host.as_deref(), Some("jump.corp.com:2222"));
+
+        // Secret should not be serialized
+        cfg.secret = Some("super_secret_password".to_string());
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        assert!(!serialized.contains("super_secret_password"));
+    }
+
+    #[test]
+    fn test_clean_ssh_error() {
+        let err = "Warning: Permanently added 'host' to the list of known hosts.\nPermission denied (publickey,password).";
+        let cleaned = clean_ssh_error(err);
+        assert_eq!(cleaned, "Permission denied (publickey,password).");
+
+        let err2 = "ssh: connect to host example.com port 22: Connection refused";
+        let cleaned2 = clean_ssh_error(err2);
+        assert_eq!(cleaned2, "ssh: connect to host example.com port 22: Connection refused");
+    }
+
+    #[test]
+    fn test_init_ssh_env() {
+        init_ssh_env();
+        // Should not panic and PATH should remain valid
+        assert!(std::env::var("PATH").is_ok());
+    }
 }

@@ -124,7 +124,7 @@ impl AddConnModal {
             let mut rows = vec![setting_row(
                 t,
                 "Connect through an SSH tunnel",
-                "Uses the system ssh; passphrase keys must be in ssh-agent",
+                "Uses the system ssh with agent, key file, or password",
                 gpui::component::switch::Switch::new("ssh-switch")
                     .checked(state.add_conn_ssh)
                     .small()
@@ -180,21 +180,28 @@ impl AddConnModal {
                     None
                 };
 
-                let host_control = div().child(
-                    Input::new(&ssh_inputs[0])
-                        .text_sm()
-                        .px_3()
-                        .when_some(host_dropdown, |input, btn| input.suffix(btn)),
-                );
+                let host_control = h_flex()
+                    .gap_2()
+                    .child(
+                        div().flex_1().child(
+                            Input::new(&ssh_inputs[0])
+                                .text_sm()
+                                .px_3()
+                                .when_some(host_dropdown, |input, btn| input.suffix(btn)),
+                        ),
+                    )
+                    .child(
+                        div().w(px(72.0)).child(
+                            Input::new(&ssh_inputs[1])
+                                .text_sm()
+                                .px_3(),
+                        ),
+                    );
 
                 rows.push(form_row(
                     t,
-                    "Host",
-                    Some(if !state.ssh_discovered_hosts.is_empty() {
-                        "Pick from ~/.ssh/config or enter host".into()
-                    } else {
-                        "Hostname or SSH config alias".into()
-                    }),
+                    "Host & Port",
+                    Some("Hostname or ~/.ssh/config alias, and port".into()),
                     None,
                     host_control,
                 ));
@@ -203,44 +210,172 @@ impl AddConnModal {
                     "User",
                     Some("Defaults to current OS user".into()),
                     None,
-                    compact_input(&ssh_inputs[1]),
+                    compact_input(&ssh_inputs[2]),
                 ));
                 rows.push(form_row(
                     t,
-                    "Private key",
-                    Some("Blank uses ssh-agent or ~/.ssh/config".into()),
+                    "Jump host",
+                    Some("Optional bastion hop (-J jump.example.com)".into()),
                     None,
-                    file_input(
-                        &ssh_inputs[2],
-                        "btn-browse-ssh-key",
-                        cx.listener(|this, _, window, cx| {
-                            this.browse_ssh_key_file(window, cx);
-                        }),
-                    ),
+                    compact_input(&ssh_inputs[5]),
                 ));
+
+                let auth_mode = state.add_conn_ssh_auth;
+                let auth_selector = segmented(t).children(
+                    [
+                        (crate::ssh::SshAuthMode::Agent, "SSH Agent"),
+                        (crate::ssh::SshAuthMode::Key, "Private Key"),
+                        (crate::ssh::SshAuthMode::Password, "Password"),
+                    ]
+                    .into_iter()
+                    .map(|(mode, label)| {
+                        chip(t, ("ssh-auth-tab", mode as usize), label, auth_mode == mode).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.state.add_conn_ssh_auth = mode;
+                                cx.notify();
+                            }),
+                        )
+                    }),
+                );
+
+                rows.push(form_row(
+                    t,
+                    "Authentication",
+                    None,
+                    None,
+                    div().child(auth_selector),
+                ));
+
+                match auth_mode {
+                    crate::ssh::SshAuthMode::Agent => {}
+                    crate::ssh::SshAuthMode::Key => {
+                        rows.push(form_row(
+                            t,
+                            "Private key",
+                            Some("Identity file (~/.ssh/id_ed25519, etc.)".into()),
+                            None,
+                            file_input(
+                                &ssh_inputs[3],
+                                "btn-browse-ssh-key",
+                                cx.listener(|this, _, window, cx| {
+                                    this.browse_ssh_key_file(window, cx);
+                                }),
+                            ),
+                        ));
+                        rows.push(form_row(
+                            t,
+                            "Passphrase",
+                            Some(if editing {
+                                "Blank keeps saved passphrase".into()
+                            } else {
+                                "Optional for encrypted keys".into()
+                            }),
+                            None,
+                            div().child(
+                                Input::new(&ssh_inputs[4])
+                                    .text_sm()
+                                    .px_3()
+                                    .content_type(InputContentType::Password)
+                                    .mask_toggle(),
+                            ),
+                        ));
+                    }
+                    crate::ssh::SshAuthMode::Password => {
+                        rows.push(form_row(
+                            t,
+                            "SSH Password",
+                            Some(if editing {
+                                "Blank keeps saved password".into()
+                            } else {
+                                "Stored in the keychain".into()
+                            }),
+                            None,
+                            div().child(
+                                Input::new(&ssh_inputs[4])
+                                    .text_sm()
+                                    .px_3()
+                                    .content_type(InputContentType::Password)
+                                    .mask_toggle(),
+                            ),
+                        ));
+                    }
+                }
             }
 
-            let agent_badge = if state.add_conn_ssh && !state.ssh_agent_keys.is_empty() {
+            let agent_badge = if state.add_conn_ssh {
+                match &state.ssh_agent_status {
+                    crate::ssh::SshAgentStatus::Loaded(keys) => Some(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(crate::ui::RADIUS_MD))
+                            .bg(t.bg_surface)
+                            .border_1()
+                            .border_color(t.border)
+                            .child(Icon::new(IconName::Key).xsmall().text_color(t.success))
+                            .child(div().text_xs().text_color(t.text_secondary).child(format!(
+                                "ssh-agent active ({} key{} loaded)",
+                                keys.len(),
+                                if keys.len() == 1 { "" } else { "s" }
+                            ))),
+                    ),
+                    crate::ssh::SshAgentStatus::Empty => Some(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(crate::ui::RADIUS_MD))
+                            .bg(t.bg_surface)
+                            .border_1()
+                            .border_color(t.border)
+                            .child(Icon::new(IconName::Key).xsmall().text_color(t.text_muted))
+                            .child(div().text_xs().text_color(t.text_secondary).child(
+                                "ssh-agent active (0 keys loaded — add keys with ssh-add)",
+                            )),
+                    ),
+                    crate::ssh::SshAgentStatus::Unavailable(_) => {
+                        if state.add_conn_ssh_auth == crate::ssh::SshAuthMode::Agent {
+                            Some(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded(px(crate::ui::RADIUS_MD))
+                                    .bg(t.bg_surface)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .child(Icon::new(IconName::CircleAlert).xsmall().text_color(t.warning))
+                                    .child(div().text_xs().text_color(t.text_secondary).child(
+                                        "No ssh-agent detected; switch to Private Key or Password",
+                                    )),
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+
+            let test_ssh_action = if state.add_conn_ssh {
                 Some(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded(px(crate::ui::RADIUS_MD))
-                        .bg(t.bg_surface)
-                        .border_1()
-                        .border_color(t.border)
-                        .child(Icon::new(IconName::Key).xsmall().text_color(t.success))
-                        .child(div().text_xs().text_color(t.text_secondary).child(format!(
-                            "ssh-agent active ({} key{} loaded)",
-                            state.ssh_agent_keys.len(),
-                            if state.ssh_agent_keys.len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            }
-                        ))),
+                    h_flex().justify_end().child(
+                        zbutton("btn-test-ssh-tunnel")
+                            .pad_sm()
+                            .label("Test SSH tunnel")
+                            .outline()
+                            .border_1()
+                            .border_color(t.border)
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.test_ssh_tunnel(window, cx);
+                            })),
+                    ),
                 )
             } else {
                 None
@@ -250,6 +385,7 @@ impl AddConnModal {
                 .gap_3()
                 .child(settings_group(t, rows))
                 .children(agent_badge)
+                .children(test_ssh_action)
         };
 
         // Advanced: limits and guard rails
