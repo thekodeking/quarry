@@ -45,6 +45,27 @@ impl Environment {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SslMode {
+    Disable,
+    #[default]
+    Prefer,
+    Require,
+    VerifyFull,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SslConfig {
+    #[serde(default)]
+    pub mode: SslMode,
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+    #[serde(default)]
+    pub client_cert: Option<String>,
+    #[serde(default)]
+    pub client_key: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConnectionProfile {
     pub id: String,
@@ -62,6 +83,8 @@ pub struct ConnectionProfile {
     /// Cancel statements running longer than this (Q10), via the dialect's statement timeout
     #[serde(default)]
     pub statement_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub ssl: Option<SslConfig>,
 }
 
 impl ConnectionProfile {
@@ -82,6 +105,7 @@ impl ConnectionProfile {
             read_only: false,
             ssh: None,
             statement_timeout_secs: None,
+            ssl: None,
         })
     }
 }
@@ -124,6 +148,15 @@ impl VimMode {
             VimMode::Visual => "-- VISUAL --",
         }
     }
+}
+
+#[derive(Clone)]
+pub struct ResultPane {
+    pub id: String,
+    pub pinned: bool,
+    pub sql_snapshot: String,
+    pub elapsed_ms: Option<u64>,
+    pub grid: Entity<TableState<ResultSet>>,
 }
 
 #[allow(dead_code)]
@@ -195,6 +228,13 @@ pub enum BottomPanelTab {
     Server,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarTab {
+    #[default]
+    Connections,
+    Queries,
+}
+
 /// Central runtime state for the Quarry desktop client.
 ///
 /// Holds open connection profiles, active sessions, the schema catalog, query history,
@@ -234,6 +274,7 @@ pub struct AppState {
     /// Connections folded shut in the sidebar (clicking an open connection folds it)
     pub collapsed_connections: std::collections::HashSet<String>,
     pub sidebar_visible: bool,
+    pub sidebar_tab: SidebarTab,
 
     // Tabs
     pub tabs: Vec<Tab>,
@@ -273,10 +314,12 @@ pub struct AppState {
     pub add_conn_env: Environment,
     pub add_conn_read_only: bool,
     pub add_conn_ssh: bool,
+    pub add_conn_ssh_auth: crate::ssh::SshAuthMode,
     /// Discovered SSH host entries from ~/.ssh/config
     pub ssh_discovered_hosts: Vec<crate::ssh::DiscoveredSshHost>,
     /// Loaded keys from ssh-agent (comments/labels)
     pub ssh_agent_keys: Vec<String>,
+    pub ssh_agent_status: crate::ssh::SshAgentStatus,
     pub add_conn_feedback: Option<(String, bool)>, // (msg, is_error)
     /// Set while the modal edits a saved connection rather than adding one
     pub editing_conn: Option<String>,
@@ -335,6 +378,7 @@ impl AppState {
             expanded_schemas: HashSet::new(),
             collapsed_connections: Default::default(),
             sidebar_visible: true,
+            sidebar_tab: SidebarTab::Connections,
 
             tabs: Vec::new(),
             recent_tables: Vec::new(),
@@ -364,8 +408,10 @@ impl AppState {
             add_conn_env: Environment::Local,
             add_conn_read_only: false,
             add_conn_ssh: false,
+            add_conn_ssh_auth: crate::ssh::SshAuthMode::Agent,
             ssh_discovered_hosts: Vec::new(),
             ssh_agent_keys: Vec::new(),
+            ssh_agent_status: crate::ssh::SshAgentStatus::Empty,
             maximized: None,
             add_conn_tab: 0,
             editing_conn: None,
@@ -422,8 +468,20 @@ impl AppState {
         }
     }
 
-    /// Makes an already-open connection active again. Returns false if it isn't open.
+    /// Returns whether the SSH tunnel for this connection is still alive (true if no tunnel)
+    pub fn is_tunnel_alive(&mut self, id: &str) -> bool {
+        match self.tunnels.get_mut(id) {
+            Some(t) => t.is_alive(),
+            None => true,
+        }
+    }
+
+    /// Makes an already-open connection active again. Returns false if it isn't open or tunnel died.
     pub fn activate_open_session(&mut self, id: &str) -> bool {
+        if !self.is_tunnel_alive(id) {
+            self.disconnect(id);
+            return false;
+        }
         let Some((session, catalog)) = self.open_sessions.get(id).cloned() else {
             return false;
         };
@@ -629,20 +687,27 @@ pub async fn open_session(
             profile.driver
         )
     })?;
+    let started = std::time::Instant::now();
     let addr = driver.display_address(&profile.path_or_url);
     tracing::info!(
-        "Connecting to [{}] ({}) via {}…",
+        "Connecting to [{}] (id={}, addr={}, driver={}, read_only={}, ssh={})…",
         profile.name,
+        profile.id,
         addr,
-        driver.name()
+        driver.name(),
+        profile.read_only,
+        profile.ssh.is_some()
     );
-    let mut conn = crate::connections::with_secret(profile);
+    let mut conn = crate::connections::try_with_secret(profile)?;
     let mut tunnel = None;
     if let Some(ssh) = &profile.ssh {
         let (host, port) = driver
             .tunnel_target(&conn)
             .ok_or_else(|| format!("{} connections can't use an SSH tunnel", driver.name()))?;
-        let cfg = ssh.clone();
+        let mut cfg = ssh.clone();
+        if cfg.secret.is_none() {
+            cfg.secret = crate::connections::ssh_secret(&profile.id);
+        }
         let target = (host.clone(), port);
         let t = tokio::task::spawn_blocking(move || crate::ssh::Tunnel::open(&cfg, &host, port))
             .await
@@ -658,7 +723,12 @@ pub async fn open_session(
         .connect(&conn, profile.read_only)
         .await
         .map_err(|e| {
-            tracing::error!("Connection to [{}] failed: {e}", profile.name);
+            tracing::error!(
+                "Connection to [{}] ({}) failed in {}ms: {e}",
+                profile.name,
+                addr,
+                started.elapsed().as_millis()
+            );
             match (&tunnel, &profile.ssh) {
                 (Some((_, target)), Some(ssh)) => tunnel_hint(&e.to_string(), target, &ssh.host),
                 _ => e.to_string(),
@@ -680,8 +750,10 @@ pub async fn open_session(
         .await
         .map_err(|e| format!("Introspection error: {}", e))?;
     tracing::info!(
-        "Connected to [{}] (loaded {} tables)",
+        "Connected to [{}] ({}) in {}ms (loaded {} tables)",
         profile.name,
+        addr,
+        started.elapsed().as_millis(),
         catalog.tables.len()
     );
     Ok((session, catalog, tunnel))

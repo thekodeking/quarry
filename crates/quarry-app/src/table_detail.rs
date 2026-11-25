@@ -123,28 +123,38 @@ impl QuarryWindow {
         ];
         h_flex()
             .items_center()
-            .gap_1()
+            .p_0p5()
+            .gap_0p5()
+            .rounded(px(crate::ui::RADIUS_MD))
+            .bg(t.bg_panel)
+            .border_1()
+            .border_color(t.border)
             .children(views.map(|(view, label, icon)| {
                 let on = view == current;
                 h_flex()
                     .id(label)
-                    .h(px(crate::ui::SMALL_H))
+                    .h(px(crate::ui::SMALL_H - 2.0))
                     .gap_1p5()
                     .items_center()
-                    .px_2p5()
+                    .px_2()
                     .rounded(px(crate::ui::RADIUS_SM))
-                    .text_sm()
+                    .text_xs()
                     .cursor_pointer()
-                    .when(on, |d| d.bg(t.bg_selected).text_color(t.text_primary))
+                    .when(on, |d| {
+                        d.bg(t.bg_selected)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.text_primary)
+                    })
                     .when(!on, |d| {
-                        d.text_color(t.text_muted).hover(|s| s.bg(t.bg_hover))
+                        d.text_color(t.text_muted)
+                            .hover(|s| s.bg(t.bg_hover).text_color(t.text_secondary))
                     })
                     .on_click(
                         cx.listener(move |this, _, window, cx| {
                             this.set_table_view(view, window, cx)
                         }),
                     )
-                    .child(gpui::component::Icon::new(icon).xsmall())
+                    .child(gpui::component::Icon::new(icon).xsmall().when(on, |i| i.text_color(t.accent)))
                     .child(label)
             }))
     }
@@ -550,6 +560,14 @@ impl QuarryWindow {
                     )
             }));
 
+        let section_card = |content: Div| {
+            content
+                .rounded(px(crate::ui::RADIUS_MD))
+                .border_1()
+                .border_color(t.border)
+                .overflow_hidden()
+        };
+
         div()
             .id("table-structure")
             .size_full()
@@ -558,15 +576,31 @@ impl QuarryWindow {
             .pb_6()
             .child(summary)
             .child(heading("COLUMNS", Some(table.columns.len())))
-            .child(columns)
+            .child(section_card(columns))
             .child(heading("INDEXES", Some(detail.indexes.len())))
-            .child(indexes)
+            .child(if detail.indexes.is_empty() {
+                indexes
+            } else {
+                section_card(indexes)
+            })
             .child(heading("FOREIGN KEYS", Some(table.foreign_keys.len())))
-            .child(foreign_keys)
+            .child(if table.foreign_keys.is_empty() {
+                foreign_keys
+            } else {
+                section_card(foreign_keys)
+            })
             .child(heading("REFERENCED BY", Some(ref_count)))
-            .child(referenced_by)
+            .child(if ref_count == 0 {
+                referenced_by
+            } else {
+                section_card(referenced_by)
+            })
             .child(heading("TRIGGERS", Some(detail.triggers.len())))
-            .child(triggers)
+            .child(if detail.triggers.is_empty() {
+                triggers
+            } else {
+                section_card(triggers)
+            })
             .into_any_element()
     }
 }

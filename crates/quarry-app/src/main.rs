@@ -24,6 +24,7 @@ mod crash_modal;
 mod crash_reporter;
 mod db_icons;
 mod editor;
+mod editor_backend;
 mod er_view;
 mod execution;
 mod export_dialog;
@@ -177,8 +178,8 @@ struct QuarryWindow {
     conn_path_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
     onboard_input: Entity<InputState>,
-    /// SSH tunnel fields in the connection form: host[:port], user, key file
-    ssh_inputs: [Entity<InputState>; 3],
+    /// SSH tunnel fields in the connection form: host, port, user, key file, secret, jump_host
+    ssh_inputs: [Entity<InputState>; 6],
     /// One input per field of the picked driver (`Driver::fields`); kept in sync with the URL field
     conn_field_inputs: Vec<Entity<InputState>>,
     conn_field_subs: Vec<Subscription>,
@@ -191,6 +192,7 @@ struct QuarryWindow {
     theme_choice: Option<Theme>,
     toast_task: Option<Task<()>>,
     session_save_task: Option<Task<()>>,
+    editor_intel_task: Option<Task<()>>,
     /// Recently closed tabs, newest last, for ⇧⌘T
     closed_tabs: Vec<(Tab, Vec<(String, Subscription)>)>,
     /// The split view's other (inactive) tab, by id
@@ -297,12 +299,20 @@ impl QuarryWindow {
         let timeout_input = cx.new(|cx| InputState::new(window, cx).placeholder("No timeout"));
         let ssh_inputs = [
             cx.new(|cx| {
-                InputState::new(window, cx).placeholder("SSH host, e.g. bastion.example.com:22")
+                InputState::new(window, cx).placeholder("bastion.example.com")
             }),
+            cx.new(|cx| InputState::new(window, cx).placeholder("22")),
             cx.new(|cx| InputState::new(window, cx).placeholder("SSH user")),
             cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("Private key file (optional; default: ssh-agent)")
+                    .placeholder("Private key file (e.g. ~/.ssh/id_ed25519)")
+            }),
+            cx.new(|cx| {
+                InputState::new(window, cx).placeholder("SSH password or key passphrase")
+            }),
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Jump host (optional, e.g. jump.example.com)")
             }),
         ];
 
@@ -370,6 +380,7 @@ impl QuarryWindow {
             theme_choice: None,
             toast_task: None,
             session_save_task: None,
+            editor_intel_task: None,
             closed_tabs: Vec::new(),
             split_id: None,
             split_active_right: false,
@@ -538,24 +549,7 @@ impl QuarryWindow {
         for tab in &self.state.tabs {
             if let Tab::Query { editor, .. } = tab {
                 editor.update(cx, |e, cx| {
-                    e.set_tab_size(
-                        gpui::base::input::TabSize {
-                            tab_size: s.tab_size.max(1),
-                            hard_tabs: false,
-                        },
-                        cx,
-                    );
                     e.set_soft_wrap(s.soft_wrap, window, cx);
-                    e.set_line_number(s.line_numbers, window, cx);
-                    e.lsp_mut().completion_menu.max_width = gpui::px(480.);
-                    e.lsp_mut().completion_provider = s.autocomplete.then(|| {
-                        std::rc::Rc::new(completion::SchemaCompletions::new(
-                            self.state.completion_catalog.clone(),
-                            Some(self.state.completion_usage.clone()),
-                            Some(self.state.completion_history.clone()),
-                        ))
-                            as std::rc::Rc<dyn gpui::component::input::CompletionProvider>
-                    });
                 });
             }
         }
@@ -689,9 +683,7 @@ impl QuarryWindow {
             } if f.extension().is_some_and(|e| e == "json") => div()
                 .size_full()
                 .child(
-                    gpui::component::input::Editor::new(editor)
-                        .h_full()
-                        .bordered(false),
+                    div().size_full().child(editor.clone()),
                 )
                 .into_any_element(),
             // Editor over results, with a draggable divider. Until the first run the editor gets the whole tab.
@@ -852,7 +844,7 @@ impl QuarryWindow {
                 .size_full()
                 .child(
                     h_flex()
-                        .h(px(BAR_H))
+                        .h(px(CONTROL_H))
                         .w_full()
                         .px_3()
                         .border_b_1()
@@ -872,7 +864,7 @@ impl QuarryWindow {
                     .size_full()
                     .child(
                         h_flex()
-                            .h(px(BAR_H))
+                            .h(px(CONTROL_H))
                             .w_full()
                             .px_3()
                             .gap_2()
@@ -1462,7 +1454,6 @@ impl QuarryWindow {
             e.lsp_mut().definition_provider = Some(std::rc::Rc::new(completion::TableDefinitions(
                 self.state.completion_catalog.clone(),
             )));
-            // ⌘-click lands here: open the table instead of following a URL. Deferred, since the editor is mid-update.
             let me = me.clone();
             e.lsp_mut().show_document = Some(std::rc::Rc::new(move |params, window, cx| {
                 let Some((schema, table)) = completion::table_link(&params.uri) else {
@@ -1482,12 +1473,12 @@ impl QuarryWindow {
         let id = format!("q-{}", uuid::Uuid::new_v4());
         // Every edit schedules a session save, so unsaved queries survive a restart (Q9)
         completion::lint_editor(&editor, &self.state.completion_catalog, cx);
-        let sub = cx.subscribe(&editor, |this, editor, ev: &InputEvent, cx| {
+        let sub = cx.subscribe_in(&editor, window, |this, editor, ev: &InputEvent, window, cx| {
             if matches!(ev, InputEvent::Change) {
-                completion::lint_editor(&editor, &this.state.completion_catalog, cx);
-                let mentioned =
-                    quarry_sql::mentioned_unloaded(&editor.read(cx).value(), &this.state.catalog);
-                this.load_schemas(mentioned, cx);
+                if editor.read(cx).value().len() > 512 * 1024 {
+                    editor.update(cx, |e, cx| e.set_soft_wrap(false, window, cx));
+                }
+                this.schedule_editor_intelligence(editor.clone(), cx);
                 this.schedule_session_save(cx);
                 cx.notify();
             }
@@ -1624,57 +1615,7 @@ impl QuarryWindow {
         editor: &Entity<EditorState>,
         cx: &mut Context<Self>,
     ) -> Subscription {
-        use gpui::component::input::{
-            RangeDecoration, RangeDecorationCollection, RangeDecorationStyle,
-        };
-        let tint = Hsla::from(self.theme.accent).opacity(0.07);
-        let decorations: std::rc::Rc<std::cell::RefCell<Option<RangeDecorationCollection>>> =
-            Default::default();
-        let mut last = (0..0, None);
-        cx.observe(editor, move |this, editor, cx| {
-            let e = editor.read(cx);
-            let sql = e.value();
-            let span = if this.settings.highlight_current_statement {
-                quarry_sql::find_statement_at_offset_with(
-                    &sql,
-                    e.cursor().min(sql.len()),
-                    this.state.dialect().split_rules(),
-                )
-                .map_or(0..0, |s| s.start..s.end)
-            } else {
-                0..0
-            };
-            let now = (span.clone(), e.cursor_layout().map(|(b, _)| b.origin.y));
-            if now == last {
-                return;
-            }
-            let span_changed = now.0 != last.0;
-            last = now;
-            if span_changed {
-                let deco = if span.is_empty() {
-                    vec![]
-                } else {
-                    vec![RangeDecoration::new(span)
-                        .with_style(RangeDecorationStyle::Fill)
-                        .with_color(tint)]
-                };
-                // Deferred: this can fire while the editor is mid-update, and updating it then aborts
-                let (editor, decorations) = (editor.clone(), decorations.clone());
-                cx.defer(move |cx| {
-                    let mut d = decorations.borrow_mut();
-                    match d.as_ref() {
-                        // `set` updates the editor itself, so it must not run inside `editor.update`
-                        Some(c) => c.set(deco, cx),
-                        None => {
-                            *d = Some(editor.update(cx, |e, cx| {
-                                e.create_range_decorations_collection(deco, cx)
-                            }))
-                        }
-                    }
-                });
-            }
-            cx.notify(); // move the gutter ▶
-        })
+        cx.observe(editor, |_, _, _| {})
     }
 
     fn open_grid_menu(
@@ -1837,6 +1778,54 @@ impl QuarryWindow {
             self.state.review_modal_open = true;
             cx.notify();
         }
+    }
+
+    fn schedule_editor_intelligence(
+        &mut self,
+        editor: Entity<EditorState>,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_intel_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+
+            let Some((sql, completion_catalog, schema_catalog)) = this
+                .update(cx, |this, cx| {
+                    let sql = editor.read(cx).value().to_string();
+                    (
+                        sql,
+                        this.state.completion_catalog.borrow().clone(),
+                        this.state.catalog.clone(),
+                    )
+                })
+                .ok()
+            else {
+                return;
+            };
+
+            if sql.len() > 200_000 {
+                return;
+            }
+
+            let (_found, mentioned) = cx
+                .background_executor()
+                .spawn({
+                    let sql = sql.clone();
+                    async move {
+                        let found = quarry_sql::lint(&sql, &completion_catalog);
+                        let mentioned = quarry_sql::mentioned_unloaded(&sql, &schema_catalog);
+                        (found, mentioned)
+                    }
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                if !mentioned.is_empty() {
+                    this.load_schemas(mentioned, cx);
+                }
+            });
+        }));
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
@@ -2251,7 +2240,9 @@ impl Render for QuarryWindow {
         let center = self.render_center(active_tab.as_ref(), cx);
 
         let sidebar = Sidebar::render(&self.state, &self.theme, self.dock, cx);
+        let tool_rail = self.render_tool_rail(cx);
         let main_layout = self.render_layout(
+            tool_rail.into_any_element(),
             sidebar.into_any_element(),
             bottom_panel,
             tab_strip,
@@ -2422,6 +2413,21 @@ impl Render for QuarryWindow {
                     }
                     _ => None,
                 },
+                match self.state.active_tab() {
+                    Some(state::Tab::Query { editor, .. }) => {
+                        let ed = editor.read(cx);
+                        let text = ed.value();
+                        let mut offset = ed.cursor().min(text.len());
+                        while offset > 0 && !text.is_char_boundary(offset) {
+                            offset -= 1;
+                        }
+                        let before = &text[..offset];
+                        let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
+                        let col = before.rsplit('\n').next().map_or(0, |s| s.chars().count()) + 1;
+                        Some((line, col))
+                    }
+                    _ => None,
+                },
                 !self.connecting.is_empty(),
                 self.available_update
                     .as_ref()
@@ -2460,7 +2466,7 @@ impl Render for QuarryWindow {
                         .px_3()
                         .py_2()
                         .rounded(px(crate::ui::RADIUS_MD))
-                        .bg(t.bg_panel)
+                        .bg(crate::theme::Theme::solid(t.bg_panel))
                         .border_1()
                         .border_color(if error { t.danger } else { t.border })
                         .shadow_lg()
@@ -2525,6 +2531,7 @@ impl Render for QuarryWindow {
 impl QuarryWindow {
     fn render_layout(
         &self,
+        tool_rail: AnyElement,
         sidebar: AnyElement,
         bottom_panel: AnyElement,
         tab_strip: Option<impl IntoElement>,
@@ -2558,7 +2565,7 @@ impl QuarryWindow {
             layout::Side::Left | layout::Side::Top => unreachable!(),
         };
 
-        match self.dock.sidebar {
+        let split = match self.dock.sidebar {
             layout::Side::Left => h_resizable("main-split:sidebar-left")
                 .on_resize(layout::remember("main-split:sidebar-left"))
                 .child(
@@ -2582,6 +2589,21 @@ impl QuarryWindow {
                 )
                 .into_any_element(),
             layout::Side::Bottom | layout::Side::Top => unreachable!(),
+        };
+
+        let content = div().flex_1().min_w_0().min_h_0().child(split);
+        if self.dock.sidebar == layout::Side::Left {
+            h_flex()
+                .size_full()
+                .child(tool_rail)
+                .child(content)
+                .into_any_element()
+        } else {
+            h_flex()
+                .size_full()
+                .child(content)
+                .child(tool_rail)
+                .into_any_element()
         }
     }
 
@@ -3070,6 +3092,22 @@ impl QuarryWindow {
 }
 
 fn main() {
+    if std::env::var("QUARRY_SSH_ASKPASS").is_ok() {
+        let prompt = std::env::args().nth(1).unwrap_or_default().to_lowercase();
+        let secret = if prompt.contains("passphrase") {
+            std::env::var("QUARRY_SSH_PASSPHRASE")
+                .or_else(|_| std::env::var("QUARRY_SSH_SECRET"))
+                .unwrap_or_default()
+        } else {
+            std::env::var("QUARRY_SSH_PASSWORD")
+                .or_else(|_| std::env::var("QUARRY_SSH_SECRET"))
+                .unwrap_or_default()
+        };
+        println!("{secret}");
+        return;
+    }
+    crate::ssh::init_ssh_env();
+
     crash_reporter::init();
     crash_reporter::add_breadcrumb("Quarry process started");
 

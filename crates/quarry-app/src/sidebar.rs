@@ -42,16 +42,29 @@ impl Sidebar {
 
         let icon = |name: IconName, color: Rgba| Icon::new(name).xsmall().text_color(color);
         let row = |id: ElementId, depth: f32| {
-            h_flex()
+            let mut d = h_flex()
                 .id(id)
-                .h(px(SMALL_H))
+                .relative()
+                .h(px(26.0))
                 .pl(px(8.0 + depth * 16.0))
                 .pr_2()
                 .gap_1p5()
                 .items_center()
                 .rounded(px(crate::ui::RADIUS_SM))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.bg_hover))
+                .hover(|s| s.bg(theme.bg_hover));
+            for level in 0..(depth as usize) {
+                d = d.child(
+                    div()
+                        .absolute()
+                        .left(px(8.0 + (level as f32) * 16.0 + 5.0))
+                        .top_0()
+                        .bottom_0()
+                        .w(px(1.0))
+                        .bg(theme.border.opacity(0.75)),
+                );
+            }
+            d
         };
         // Leaves skip the chevron column, so a spacer keeps their icon under the parent's label
         let leaf =
@@ -236,7 +249,15 @@ impl Sidebar {
                         .child(label(schema.clone(), theme.text_secondary))
                         // Not loaded yet (big databases): no count rather than a wrong 0
                         .when(state.catalog.is_loaded(schema), |d| {
-                            d.child(muted(tables.len().to_string()))
+                            d.child(
+                                div()
+                                    .px_1p5()
+                                    .rounded(px(crate::ui::RADIUS_SM))
+                                    .bg(theme.bg_surface)
+                                    .text_xs()
+                                    .text_color(theme.text_muted)
+                                    .child(tables.len().to_string()),
+                            )
                         }),
                 );
                 if !expanded {
@@ -502,8 +523,69 @@ impl Sidebar {
                 .child(text)
         };
 
+        let is_queries = state.sidebar_tab == crate::state::SidebarTab::Queries;
         let is_right = dock.sidebar == crate::layout::Side::Right;
         let this_entity = cx.entity().clone();
+        let header_actions = if is_queries {
+            h_flex()
+                .items_center()
+                .gap_0p5()
+                .child(
+                    zbutton("sidebar-new-query")
+                        .icon(IconName::Plus)
+                        .ghost()
+                        .xsmall()
+                        .tooltip(format_keys("New query (⌘N)"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.new_query(&crate::NewQuery, window, cx)
+                        })),
+                )
+                .child(
+                    zbutton("sidebar-open-file")
+                        .icon(IconName::FolderOpen)
+                        .ghost()
+                        .xsmall()
+                        .tooltip(format_keys("Open file (⌘O)"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_sql_file(window, cx)
+                        })),
+                )
+        } else {
+            h_flex()
+                .items_center()
+                .gap_0p5()
+                .child(
+                    zbutton("sidebar-add-conn")
+                        .icon(IconName::Plus)
+                        .ghost()
+                        .xsmall()
+                        .tooltip(format_keys("New connection (⇧⌘N)"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_add_conn(window, cx)
+                        })),
+                )
+                .when(state.session.is_some(), |d| {
+                    d.child(
+                        zbutton("sidebar-refresh-schema")
+                            .icon(IconName::RefreshCw)
+                            .ghost()
+                            .xsmall()
+                            .tooltip("Refresh schema")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.refresh_catalog(window, cx)
+                            })),
+                    )
+                })
+                .child(
+                    zbutton("sidebar-collapse-all")
+                        .icon(IconName::Minus)
+                        .ghost()
+                        .xsmall()
+                        .tooltip("Collapse all")
+                        .on_click(cx.listener(|this, _, _, cx| this.collapse_sidebar_all(cx))),
+                )
+        };
+
         v_flex()
             .size_full()
             .bg(theme.bg_sidebar)
@@ -517,6 +599,8 @@ impl Sidebar {
                     .px_3()
                     .items_center()
                     .justify_between()
+                    .border_b_1()
+                    .border_color(theme.border)
                     .cursor_grab()
                     .on_drag(crate::layout::DraggedPane(crate::layout::Pane::Sidebar), {
                         let this_entity = this_entity.clone();
@@ -533,61 +617,30 @@ impl Sidebar {
                             this.open_sidebar_dock_menu(window, cx);
                         }),
                     )
-                    .child(section_title("Connections"))
-                    .child(
-                        zbutton("sidebar-add-conn")
-                            .pad_xs()
-                            .icon(IconName::Plus)
-                            .label("New")
-                            .ghost()
-                            .small()
-                            .tooltip(format_keys("New connection (⇧⌘N)"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_add_conn(window, cx)
-                            })),
-                    ),
+                    .child(section_title(if is_queries {
+                        "Saved Queries"
+                    } else {
+                        "Database Explorer"
+                    }))
+                    .child(header_actions),
             )
-            .child(
-                div().flex_1().min_h_0().child(
-                    // Drag the divider to give queries more or less room
-                    gpui::component::resizable::v_resizable("sidebar-split")
-                        .on_resize(crate::layout::remember("sidebar-split"))
-                        .child(
-                            gpui::component::resizable::resizable_panel().child(
-                                div()
-                                    .id("sidebar-tree-scroll")
-                                    .size_full()
-                                    .overflow_y_scroll()
-                                    .child(tree),
-                            ),
-                        )
-                        .child(
-                            gpui::component::resizable::resizable_panel()
-                                .size(crate::layout::size("sidebar-split", 1, 200.0))
-                                .size_range(px(BAR_H)..px(2000.0))
-                                .child(
-                                    v_flex()
-                                        .size_full()
-                                        .child(
-                                            h_flex()
-                                                .h(px(BAR_H))
-                                                .flex_none()
-                                                .px_3()
-                                                .items_center()
-                                                .child(section_title("Queries")),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("sidebar-queries-scroll")
-                                                .flex_1()
-                                                .min_h_0()
-                                                .overflow_y_scroll()
-                                                .child(query_list),
-                                        ),
-                                ),
-                        ),
-                ),
-            )
+            .child(if is_queries {
+                div()
+                    .id("sidebar-queries-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(query_list)
+                    .into_any_element()
+            } else {
+                div()
+                    .id("sidebar-tree-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(tree)
+                    .into_any_element()
+            })
             .into_any_element()
     }
 }
@@ -666,6 +719,15 @@ impl QuarryWindow {
     fn toggle_sidebar_group(&mut self, key: String, cx: &mut Context<Self>) {
         if !self.state.expanded_object_groups.remove(&key) {
             self.state.expanded_object_groups.insert(key);
+        }
+        cx.notify();
+    }
+
+    fn collapse_sidebar_all(&mut self, cx: &mut Context<Self>) {
+        self.state.expanded_schemas.clear();
+        self.state.expanded_object_groups.clear();
+        for conn in &self.state.saved_connections {
+            self.state.collapsed_connections.insert(conn.id.clone());
         }
         cx.notify();
     }

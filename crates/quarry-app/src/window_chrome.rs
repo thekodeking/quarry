@@ -128,7 +128,7 @@ impl QuarryWindow {
                             .child(crate::ui::format_keys("⌘K")),
                     ),
             )
-            // Mirrors the traffic-light gutter on the left
+            // Mirrors the traffic-light gutter on the left, with quick workspace actions on the right
             .child(
                 h_flex()
                     .flex_1()
@@ -142,10 +142,228 @@ impl QuarryWindow {
                             .h_full()
                             .window_control_area(WindowControlArea::Drag),
                     )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_0p5()
+                            .pr_1()
+                            .child(
+                                zbutton("titlebar-new-query")
+                                    .icon(IconName::Plus)
+                                    .ghost()
+                                    .small()
+                                    .tooltip(crate::ui::format_keys("New query (⌘N)"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.new_query(&NewQuery, window, cx)
+                                    })),
+                            )
+                            .child(
+                                zbutton("titlebar-toggle-sidebar")
+                                    .icon(IconName::Columns2)
+                                    .ghost()
+                                    .small()
+                                    .when(self.state.sidebar_visible, |b| b.text_color(t.accent))
+                                    .tooltip(crate::ui::format_keys("Toggle sidebar (⌘B)"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_sidebar(&ToggleSidebar, window, cx)
+                                    })),
+                            )
+                            .child(
+                                zbutton("titlebar-toggle-panel")
+                                    .icon(if self.state.bottom_panel_open {
+                                        IconName::PanelTopClose
+                                    } else {
+                                        IconName::PanelTopOpen
+                                    })
+                                    .ghost()
+                                    .small()
+                                    .when(self.state.bottom_panel_open, |b| b.text_color(t.accent))
+                                    .tooltip(crate::ui::format_keys("Toggle panel (⌘J)"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_bottom_panel(&ToggleBottomPanel, window, cx)
+                                    })),
+                            )
+                            .child(
+                                zbutton("titlebar-settings")
+                                    .icon(IconName::Settings2)
+                                    .ghost()
+                                    .small()
+                                    .tooltip(crate::ui::format_keys("Settings (⌘,)"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_settings(cx)
+                                    })),
+                            ),
+                    )
                     .when(cfg!(target_os = "windows"), |d| {
                         d.children(self.render_caption_buttons(window))
                     }),
             )
+    }
+
+    /// Slim JetBrains/Zed-style outer tool-window rail for sidebar & bottom panel views
+    pub(crate) fn render_tool_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = &self.theme;
+        let is_right = self.dock.sidebar == layout::Side::Right;
+        let rail_btn = |id: &'static str, icon: IconName, active: bool, tip: &'static str| {
+            div()
+                .id(id)
+                .relative()
+                .size(px(32.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(crate::ui::RADIUS_MD))
+                .cursor_pointer()
+                .when(active, |d| d.bg(t.bg_selected).text_color(t.accent))
+                .when(!active, |d| {
+                    d.text_color(t.text_muted)
+                        .hover(|s| s.bg(t.bg_hover).text_color(t.text_primary))
+                })
+                .tooltip(move |window, cx| {
+                    gpui::component::tooltip::Tooltip::new(crate::ui::format_keys(tip))
+                        .build(window, cx)
+                })
+                .when(active, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .when(!is_right, |b| b.left(px(-5.0)))
+                            .when(is_right, |b| b.right(px(-5.0)))
+                            .top(px(6.0))
+                            .bottom(px(6.0))
+                            .w(px(2.0))
+                            .rounded_full()
+                            .bg(t.accent),
+                    )
+                })
+                .child(Icon::new(icon).size(px(16.0)))
+        };
+
+        v_flex()
+            .w(px(42.0))
+            .h_full()
+            .flex_shrink_0()
+            .py_2()
+            .items_center()
+            .justify_between()
+            .bg(t.bg_sidebar)
+            .when(is_right, |d| d.border_l_1())
+            .when(!is_right, |d| d.border_r_1())
+            .border_color(t.border)
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        rail_btn(
+                            "rail-connections",
+                            IconName::Database,
+                            self.state.sidebar_visible
+                                && self.state.sidebar_tab == crate::state::SidebarTab::Connections,
+                            "Database Explorer (⌘B)",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.state.sidebar_visible
+                                && this.state.sidebar_tab
+                                    == crate::state::SidebarTab::Connections
+                            {
+                                this.state.sidebar_visible = false;
+                            } else {
+                                this.state.sidebar_visible = true;
+                                this.state.sidebar_tab = crate::state::SidebarTab::Connections;
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        rail_btn(
+                            "rail-queries",
+                            IconName::FileCode,
+                            self.state.sidebar_visible
+                                && self.state.sidebar_tab == crate::state::SidebarTab::Queries,
+                            "Saved Queries",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.state.sidebar_visible
+                                && this.state.sidebar_tab == crate::state::SidebarTab::Queries
+                            {
+                                this.state.sidebar_visible = false;
+                            } else {
+                                this.state.sidebar_visible = true;
+                                this.state.sidebar_tab = crate::state::SidebarTab::Queries;
+                            }
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        rail_btn(
+                            "rail-output",
+                            IconName::SquareTerminal,
+                            self.state.bottom_panel_open
+                                && self.state.bottom_panel_tab
+                                    == crate::state::BottomPanelTab::Messages,
+                            "Output (⌘J)",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_panel_tab(crate::state::BottomPanelTab::Messages, cx)
+                        })),
+                    )
+                    .child(
+                        rail_btn(
+                            "rail-history",
+                            IconName::ScrollText,
+                            self.state.bottom_panel_open
+                                && self.state.bottom_panel_tab
+                                    == crate::state::BottomPanelTab::History,
+                            "Query History",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_panel_tab(crate::state::BottomPanelTab::History, cx)
+                        })),
+                    )
+                    .child(
+                        rail_btn(
+                            "rail-logs",
+                            IconName::ListFilter,
+                            self.state.bottom_panel_open
+                                && self.state.bottom_panel_tab
+                                    == crate::state::BottomPanelTab::Logs,
+                            "Activity Log",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_panel_tab(crate::state::BottomPanelTab::Logs, cx)
+                        })),
+                    )
+                    .child(
+                        rail_btn(
+                            "rail-server",
+                            IconName::Server,
+                            self.state.bottom_panel_open
+                                && self.state.bottom_panel_tab
+                                    == crate::state::BottomPanelTab::Server,
+                            "Server Monitor",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_panel_tab(crate::state::BottomPanelTab::Server, cx)
+                        })),
+                    ),
+            )
+    }
+
+    fn toggle_panel_tab(&mut self, tab: crate::state::BottomPanelTab, cx: &mut Context<Self>) {
+        if self.state.bottom_panel_open && self.state.bottom_panel_tab == tab {
+            self.state.bottom_panel_open = false;
+        } else {
+            self.state.bottom_panel_open = true;
+            self.state.bottom_panel_tab = tab;
+        }
+        cx.notify();
     }
 
     /// Windows draws no frame around our title bar: min / max / close, clicked through to the OS
@@ -324,10 +542,17 @@ impl QuarryWindow {
                         .cursor_pointer()
                         .group("tab-row")
                         .relative()
-                        // Active tab: joins the content below and carries a 2px accent cap
+                        // Active tab: joins the content below and carries a JetBrains-style bottom accent bar
                         .when(is_active, |d| {
                             d.bg(t.bg_app).child(
-                                div().absolute().top_0().left_0().right_0().h(px(2.0)).bg(accent),
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_1()
+                                    .right_1()
+                                    .h(px(2.0))
+                                    .rounded_full()
+                                    .bg(accent),
                             )
                         })
                         .when(!is_active, |d| d.hover(|s| s.bg(t.bg_hover)))
@@ -348,6 +573,11 @@ impl QuarryWindow {
                             this.active_drag_tab = None;
                             this.reorder_tab(from_idx, idx, cx);
                         }))
+                        .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab_at(idx, cx);
+                            this.refocus_root(window, cx);
+                        }))
                         .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
                             this.state.active_tab_index = idx;
                             // Double-clicking a preview tab keeps it
@@ -356,12 +586,14 @@ impl QuarryWindow {
                             }
                             cx.notify();
                         }))
-                        .when_some(env_color, |d, c| d.border_b_2().border_color(c))
                         .when_some(table_obj, |d, obj| {
                             d.on_mouse_down(MouseButton::Right, cx.listener(move |this, _, window, cx| {
                                 this.state.active_tab_index = idx;
                                 this.open_object_menu(obj.clone(), window, cx);
                             }))
+                        })
+                        .when_some(env_color, |d, c| {
+                            d.child(div().size(px(6.0)).rounded_full().bg(c).flex_shrink_0())
                         })
                         .child(Icon::new(icon).xsmall().text_color(if is_active { t.accent } else { t.text_muted }))
                         .child(

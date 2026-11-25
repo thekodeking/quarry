@@ -37,6 +37,25 @@ pub use actions::*;
 pub use analytics::*;
 pub use editing::{Fetch, PageTo};
 
+/// Formats a cell value lazily for the value inspector, capping pretty-printing at 256 KB.
+pub fn format_cell_preview(raw: &str) -> (String, &'static str) {
+    if raw.len() > 256 * 1024 {
+        return (
+            format!("[Large value: {} bytes — use Copy to inspect]", raw.len()),
+            "text",
+        );
+    }
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Ok(pretty) = serde_json::to_string_pretty(&val) {
+                return (pretty, "json");
+            }
+        }
+    }
+    (raw.to_string(), "text")
+}
+
 actions!(
     grid,
     [

@@ -4,7 +4,7 @@
 use crate::state::{AppState, ConnectionProfile, Environment};
 use crate::theme::Theme;
 use crate::ui::*;
-use crate::{CommitTx, QuarryWindow, RollbackTx, ToggleBottomPanel, ToggleSidebar, ToggleTxMode};
+use crate::{CommitTx, QuarryWindow, RollbackTx, ToggleTxMode};
 use gpui::component::ActiveTheme;
 use gpui::*;
 use quarry_core::DatabaseSession;
@@ -18,6 +18,7 @@ impl StatusBar {
         session: Option<&Arc<dyn DatabaseSession>>,
         connection: Option<&ConnectionProfile>,
         vim_mode: Option<crate::state::VimMode>,
+        cursor_pos: Option<(usize, usize)>,
         connecting: bool,
         // (version, installing)
         update: Option<(&str, bool)>,
@@ -212,9 +213,9 @@ impl StatusBar {
                     }),
             )
             .child(
-                // Right items: result stats, then quiet toggles (also on ⌘B / ⌘J and in ⌘K)
+                // Right items: cursor position, result stats, dialect, version
                 h_flex()
-                    .gap_1()
+                    .gap_3()
                     .items_center()
                     .children(update.map(|(version, installing)| {
                         let label = if installing {
@@ -223,54 +224,36 @@ impl StatusBar {
                             format!("Update to {version}")
                         };
                         link("statusbar-update", &label, theme.accent)
-                            .mr_3()
                             .font_weight(FontWeight::SEMIBOLD)
                             .on_click(cx.listener(|this, _, _, cx| this.install_update(cx)))
+                    }))
+                    .children(cursor_pos.map(|(line, col)| {
+                        div()
+                            .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_color(theme.text_secondary)
+                            .child(format!("Ln {line}, Col {col}"))
                     }))
                     // Mono digits: the timing changes every run and mustn't jiggle
                     .children(stats.map(|s| {
                         div()
-                            .mr_3()
                             .text_xs()
                             .font_family(cx.theme().mono_font_family.clone())
                             .text_color(theme.text_muted)
                             .child(s)
                     }))
-                    .child(
-                        link(
-                            "statusbar-toggle-sidebar",
-                            &format_keys("Sidebar ⌘B"),
-                            if state.sidebar_visible {
-                                theme.text_secondary
-                            } else {
-                                theme.text_muted
-                            },
-                        )
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.toggle_sidebar(&ToggleSidebar, window, cx)
-                            },
-                        )),
-                    )
-                    .child(
-                        link(
-                            "statusbar-toggle-bottom",
-                            &format_keys("Panel ⌘J"),
-                            if state.bottom_panel_open {
-                                theme.text_secondary
-                            } else {
-                                theme.text_muted
-                            },
-                        )
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.toggle_bottom_panel(&ToggleBottomPanel, window, cx)
-                            },
-                        )),
-                    )
+                    .children(connection.map(|c| {
+                        let dialect = c.driver().map(|d| d.name()).unwrap_or(&c.driver);
+                        div()
+                            .px_1p5()
+                            .rounded(px(crate::ui::RADIUS_SM))
+                            .bg(theme.bg_surface)
+                            .text_xs()
+                            .text_color(theme.text_secondary)
+                            .child(dialect.to_string())
+                    }))
                     .child(
                         div()
-                            .ml_2()
                             .text_xs()
                             .text_color(theme.text_muted)
                             .child(concat!("v", env!("CARGO_PKG_VERSION"))),
