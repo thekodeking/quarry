@@ -397,6 +397,64 @@ impl QuarryWindow {
         .detach();
     }
 
+    /// Streams a `.sql` file from disk and executes its statements without loading it into an editor
+    pub fn run_sql_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.state.session.clone() else {
+            return self.toast("Connect to a database first", true, cx);
+        };
+        let rules = self.state.dialect().split_rules();
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Run SQL File".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.toast(format!("Running {name}…"), false, cx);
+                let fut = async move {
+                    let started = std::time::Instant::now();
+                    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+                    let reader = std::io::BufReader::new(file);
+                    let mut count = 0usize;
+                    for stmt in quarry_sql::StatementStream::new(reader, rules) {
+                        let sql = stmt.map_err(|e| e.to_string())?;
+                        session
+                            .execute(&sql)
+                            .await
+                            .map_err(|e| format!("Statement {}: {e}", count + 1))?;
+                        count += 1;
+                    }
+                    Ok::<(usize, u128), String>((count, started.elapsed().as_millis()))
+                };
+                crate::runtime::run_db(window, cx, fut, move |this, res, window, cx| match res {
+                    Ok((count, ms)) => {
+                        let msg = format!("Executed {count} statements from {name} in {ms}ms");
+                        this.state.messages.push(msg.clone());
+                        this.toast(msg, false, cx);
+                        this.refresh_catalog(window, cx);
+                    }
+                    Err(e) => {
+                        let msg = format!("{name} failed: {e}");
+                        this.state.messages.push(msg.clone());
+                        this.toast(msg, true, cx);
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
     /// Writes open query tabs to disk shortly after typing stops, so nothing is lost
     pub fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
         self.session_save_task = Some(cx.spawn(async move |this, cx| {

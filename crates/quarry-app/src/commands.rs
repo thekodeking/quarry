@@ -219,6 +219,8 @@ impl QuarryWindow {
             self.format_query(window, cx);
         } else if action_id == "action:open_file" {
             self.open_sql_file(window, cx);
+        } else if action_id == "action:run_file" {
+            self.run_sql_file(window, cx);
         } else if action_id == "action:save_file" {
             self.save_query(false, window, cx);
         } else if action_id == "action:export" {

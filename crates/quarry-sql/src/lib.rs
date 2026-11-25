@@ -20,6 +20,7 @@ pub mod completer;
 pub mod params;
 pub mod rewrites;
 pub mod splitter;
+pub mod stream;
 
 pub use completer::{
     extract_ctes, extract_select_columns, find_usages, lint, match_score, mentioned_unloaded,
@@ -33,3 +34,4 @@ pub use splitter::{
     split_statements_with, tree_sitter_split_statements, tree_sitter_statement_at_offset,
     SplitRules, StatementSpan,
 };
+pub use stream::StatementStream;
