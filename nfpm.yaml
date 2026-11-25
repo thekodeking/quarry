@@ -27,9 +27,17 @@ contents:
     dst: /usr/bin/quarry
     file_info:
       mode: 0755
-  - src: scripts/quarry.desktop
+  - src: packaging/linux/quarry.desktop
     dst: /usr/share/applications/quarry.desktop
+  - src: assets/icon/quarry-16.png
+    dst: /usr/share/icons/hicolor/16x16/apps/quarry.png
+  - src: assets/icon/quarry-32.png
+    dst: /usr/share/icons/hicolor/32x32/apps/quarry.png
   - src: assets/icon/quarry-128.png
     dst: /usr/share/icons/hicolor/128x128/apps/quarry.png
   - src: assets/icon/quarry-256.png
     dst: /usr/share/icons/hicolor/256x256/apps/quarry.png
+  - src: assets/icon/quarry-512.png
+    dst: /usr/share/icons/hicolor/512x512/apps/quarry.png
+  - src: assets/icon/quarry.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/quarry.svg
