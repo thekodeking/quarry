@@ -418,6 +418,13 @@ pub fn lint_editor(
 ) {
     use gpui::base::input::{Diagnostic, DiagnosticSeverity};
     editor.update(cx, |e, cx| {
+        if e.value().len() > 200_000 {
+            if let Some(set) = e.diagnostics_mut() {
+                set.reset(&Rope::from(""));
+                cx.notify();
+            }
+            return;
+        }
         let sql = e.value().to_string();
         let rope = Rope::from(sql.as_str());
         let found = quarry_sql::lint(&sql, &catalog.borrow());
@@ -439,7 +446,6 @@ pub fn lint_editor(
 }
 
 /// Error squiggle for a failed run, kept until the next edit re-lints the editor.
-/// `stmt` is the failed statement's text; `at` is the 1-based character Postgres reported, if any.
 pub fn mark_run_error(
     editor: &gpui::Entity<gpui::component::input::EditorState>,
     stmt: &str,

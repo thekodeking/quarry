@@ -132,7 +132,7 @@ impl QueryEditor {
                 h_flex()
                     .w_full()
                     .min_w_0()
-                    .h(px(BAR_H))
+                    .h(px(CONTROL_H))
                     .px_3()
                     // A faint red wash on prod, so it's obvious before you run anything
                     .bg(if is_prod {
@@ -154,6 +154,18 @@ impl QueryEditor {
                             .child(conn_label)
                             .children(schema_picker.map(|p| p.flex_shrink_0()))
                             .child(limit_picker.flex_shrink_0())
+                            .when(editor.read(cx).value().len() > 512 * 1024, |d| {
+                                d.child(
+                                    div()
+                                        .px_1p5()
+                                        .py(px(1.0))
+                                        .rounded(px(crate::ui::RADIUS_SM))
+                                        .bg(theme.bg_surface)
+                                        .text_xs()
+                                        .text_color(theme.text_muted)
+                                        .child("Large file"),
+                                )
+                            })
 
                     )
                     .child(
@@ -246,27 +258,11 @@ impl QueryEditor {
                             }
                         }))
                     })
-                    // Tab picks the highlighted suggestion when the menu is open, like Enter; otherwise it indents
-                    .capture_action({
-                        let editor = editor.clone();
-                        move |_: &gpui::component::input::IndentInline, window, cx| {
-                            let handled = editor.update(cx, |state, cx| {
-                                state.completion_menu_state().open
-                                    && state.route_overlay_action(
-                                        Box::new(gpui::component::input::Enter {
-                                            secondary: false,
-                                            shift: false,
-                                        }),
-                                        window,
-                                        cx,
-                                    )
-                            });
-                            if handled {
-                                cx.stop_propagation();
-                            }
-                        }
-                    })
-                    .child(Editor::new(editor).h_full().bordered(false))
+                    .child(
+                        Editor::new(editor)
+                            .h_full()
+                            .bordered(false),
+                    )
                     // The editor only draws a bar; the block goes on top, at the caret it laid out
                     .when_some(block_cursor, |d, w| {
                         let editor = editor.clone();
@@ -336,6 +332,10 @@ fn run_gutter_buttons(
     };
     let scroll_y = e.scroll_offset().y;
     let sql = e.value();
+    // Large SQL scripts (e.g. bulk data loads) would otherwise re-parse thousands of statements every frame
+    if sql.len() > 256_000 {
+        return vec![];
+    }
     let area = e.input_bounds();
     let starts: Vec<usize> = if rules.go_batches || rules.slash_blocks {
         quarry_sql::split_statements_with(&sql, rules)
@@ -348,7 +348,11 @@ fn run_gutter_buttons(
             .map(|s| s.start)
             .collect()
     };
-    let lines: Vec<usize> = sql.split('\n').map(|l| l.chars().count()).collect();
+    let lines: Vec<usize> = if soft_wrap {
+        sql.split('\n').map(|l| l.chars().count()).collect()
+    } else {
+        Vec::new()
+    };
     let wrap_cols = (area.size.width / (line_height * 0.45)).floor() as usize;
     let fits = |line: usize| {
         !soft_wrap
@@ -357,11 +361,17 @@ fn run_gutter_buttons(
                 .all(|n| *n < wrap_cols)
     };
     let x = area.origin.x - px(RUN_COL_W) + px(3.0);
+    let mut line = 0usize;
+    let mut last_pos = 0usize;
     starts
         .into_iter()
         .enumerate()
         .filter_map(|(ix, start)| {
-            let line = sql[..start.min(sql.len())].matches('\n').count();
+            let clamped = start.min(sql.len());
+            if clamped > last_pos {
+                line += sql[last_pos..clamped].matches('\n').count();
+                last_pos = clamped;
+            }
             if !fits(line) {
                 return None;
             }
